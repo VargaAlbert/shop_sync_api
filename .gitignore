@@ -1,0 +1,19 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# venv
+.venv/
+
+# env
+.env
+
+# runtime data
+data/
+
+# vscode
+.vscode/
+
+# doc
+doc/
