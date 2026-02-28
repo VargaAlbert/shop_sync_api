@@ -13,7 +13,7 @@ def parse_csv_bytes(
     CSV fájl feldolgozása byte formátumból.
 
     A függvény egy byte formátumban kapott CSV állományt alakít át
-    Python szótárak listájává. A fejléc sor alapján kulcs–érték
+    Python szótárak listájává. A fejléc sor alapján kulcs-érték
     párokat hoz létre minden egyes adatsorhoz.
 
     Tipikus felhasználás:

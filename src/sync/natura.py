@@ -53,7 +53,10 @@ from typing import Any, Dict, List, Tuple
 from dotenv import load_dotenv
 
 from src.ingest.suppliers_csv import ingest_one_supplier_csv
-from src.normalize.natura import normalize_natura_rows
+
+import src.normalize.suppliers  # fontos: regisztrálja a normalizálókat
+from src.normalize import normalize_rows
+
 from src.shoprenter.payloads_natura import (
     build_product_extend_from_natura,
     build_update_payload_from_full,
@@ -225,7 +228,7 @@ def load_natura_products() -> List[Dict[str, Any]]:
     Beolvassa + normalizálja a natura beszállító CSV-t.
     """
     raw = ingest_one_supplier_csv("natura")
-    products = normalize_natura_rows(raw)
+    products = normalize_rows("natura", raw)
     print("RAW:", len(raw))
     print("NORMALIZED:", len(products))
     return products
