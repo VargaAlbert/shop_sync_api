@@ -1,0 +1,9 @@
+{
+  "name": "natura",
+  "type": "csv",
+  "source": {
+    "url": "file:///C:/Tarhely/shop_sync_api/data/sources/natura/webaruhaz.csv",
+    "encoding": "utf-8",
+    "delimiter": ","
+  }
+}

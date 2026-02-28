@@ -1,0 +1,12 @@
+{
+  "sku": ["NATURASOFTID"],
+  "model": ["product.sku"],
+  "name": ["product_description.name.hu"],
+  "unit_name": ["product_description.quantity_name.hu"],
+  "gross_price": ["BRUTTOAR4"],
+  "wholesale_price": ["BRUTTOAR3"],
+  "manufacturer_name": ["CSOPORT3"],
+  "tax_class_id": ["product.tax_class_id"],
+  "gtin": ["product.gtin"],
+  "csoport1_name": ["CSOPORT1"]
+}
