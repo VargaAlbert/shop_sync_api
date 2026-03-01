@@ -1,0 +1,13 @@
+{
+  "type": "csv",
+  "source": {
+    "url": "https://.../haldepo.csv"
+  },
+  "encoding": "utf-8",
+  "delimiter": ";",
+  "has_header": true,
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 86400
+  }
+}

@@ -50,12 +50,45 @@ DEFAULT_CATEGORY_ID = "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4"
 UPDATE_FIELDS = {
     "sku",
     "price",
-    "stock1",
-    # ha akarod:
-    # "status",
-    # "productDescriptions",  # csak ha név is frissül
+    "gtin",
+    "modelNumber",
+    "productDescriptions",
+    "customer_group_prices",
+    "_post_actions"
 }
 
+
+from typing import Any, Dict, Optional, Mapping, List, TypedDict
+
+WHOLESALE_GROUP_NAME_DEFAULT = "NAGYKER"
+
+
+class CustomerGroupPriceIntent(TypedDict, total=False):
+    customer_group_name: str
+    price: str  # Shoprenter stringként szereti
+
+
+def build_customer_group_product_price_payload(
+    *,
+    product_id: str,
+    customer_group_id: str,
+    price: float,
+) -> Dict[str, Any]:
+    """
+    Customer Group Product Price payload (POST/PUT /customerGroupProductPrices)
+
+    Fixture alapján:
+      {
+        "price": "4237.5",
+        "customerGroup": {"id": "..."},
+        "product": {"id": "..."}
+      }
+    """
+    return {
+        "price": f"{float(price):.4f}",
+        "customerGroup": {"id": customer_group_id},
+        "product": {"id": product_id},
+    }
 
 def build_update_payload_from_full(full_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -77,7 +110,6 @@ def build_update_payload_from_full(full_payload: Dict[str, Any]) -> Dict[str, An
         Ha később több mezőt akarsz frissíteni, az UPDATE_FIELDS halmazt bővítsd.
     """
     return {k: v for k, v in full_payload.items() if k in UPDATE_FIELDS and v is not None}
-
 
 def build_product_extend_from_natura(
     p: Dict[str, Any],
@@ -230,6 +262,18 @@ def build_product_extend_from_natura(
         # Kategória reláció
         "productCategoryRelations": [{"category": {"id": resolved_category_id}}],
     }
+
+    # --- vevőcsoport ár intent (NAGYKER) ---
+    wholesale = p.get("wholesale_price")
+    if wholesale is not None:
+        payload["_post_actions"] = {
+            "customer_group_prices": [
+                {
+                    "customer_group_name": WHOLESALE_GROUP_NAME_DEFAULT,
+                    "price": f"{float(wholesale):.4f}",
+                }
+            ]
+        }
 
     # Kép mezők: mainPicture + imageAlt
     # (Ha az API create-nél sem fogadja, később külön image endpointtal kell feltölteni.)

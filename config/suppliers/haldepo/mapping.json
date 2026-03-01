@@ -1,0 +1,8 @@
+{
+  "model": ["modelNumber", "model", "cikkszam", "cikkszám", "termekkod", "termékkód", "kod", "kód"],
+  "description_hu": ["leiras", "leírás", "description_hu", "desc", "html_leiras"],
+  "image_url": ["image_url", "kep_url", "kép_url", "main_image", "image"],
+  "image_path": ["image_path", "kep_fajl", "kép_fájl", "filename"],
+  "gtin": ["gtin", "ean", "barcode", "vonalkod", "vonalkód"],
+  "manufacturer": ["gyarto", "gyártó", "brand", "marka", "márka"]
+}

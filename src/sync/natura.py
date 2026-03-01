@@ -266,12 +266,7 @@ def run_upsert(*, client: ShoprenterClient) -> Dict[str, int]:
     # payloadok előkészítése (mindig 0-ról indul)
     payloads: List[Dict[str, Any]] = []
     for p in products:
-        payload = build_product_extend_from_natura(
-            p,
-            language_id=LANGUAGE_ID,
-            status_value=1,
-            stock1=0,
-        )
+        payload = build_product_extend_from_natura(p, language_id=LANGUAGE_ID)
         payload.pop("_debug", None)
         payloads.append(payload)
 
