@@ -64,7 +64,7 @@ TEST_PRODUCT_SKU=
 3) Egy konkrét SKU tesztelése:
     python -m src.runner.preview_runner --sku 2954 --write
 
-4) Haldepó ENRICH + wholesale override bekapcsolása:
+4) ENRICH + wholesale override bekapcsolása:
     python -m src.runner.preview_runner --with-haldepo --write
 
 5) Limitált elemszám:
@@ -142,7 +142,6 @@ import src.normalize.suppliers  # registry bootstrap
 from src.normalize import normalize_rows
 
 from src.shoprenter.payloads_natura import build_payload
-from src.shoprenter.payloads_enrich import build_enrich_update_payload
 
 from src.utils.export_debug import (
     reset_file,
@@ -157,8 +156,10 @@ from src.merge.merge_products import (
     merge_master_with_enricher,
 )
 
-from src.merge.rules.haldepo_wholesale import HaldepoWholesalePlugin
-from src.merge.rules.plugins import WholesalePlugin
+from src.merge.rules.haldepo_wholesale import HaldepoWholesalePlugin # ez nem tudom kell e még 
+
+from src.merge.rules.enrich_registry import get_all_enrich_plugins
+from src.merge.rules.enrich_plugins import EnrichPlugin
 
 load_dotenv()
 
@@ -223,14 +224,19 @@ def build_sku_map_preview_request(*, base_url: str, page: int = 1, limit: int = 
 # -------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="Shop Sync preview runner (payload + enrich + delete previews)")
+
     parser.add_argument("--write", action="store_true", help="Write debug output files")
     parser.add_argument("--sku", default=TEST_PRODUCT_SKU, help="Only process this SKU (or env TEST_PRODUCT_SKU)")
     parser.add_argument("--limit", type=int, default=0, help="Limit processed products (0 = no limit)")
-    parser.add_argument("--with-haldepo", action="store_true", help="Enable Haldepó enrich merge + wholesale override")
     parser.add_argument("--quiet", action="store_true", help="Less console output")
+
+    # ENRICH: csak 'all' vagy üres (disabled)
+    parser.add_argument("--enrich", default="", help="Enrich mode: 'all' or empty (disabled)")
 
     # delete previewhoz: id placeholder vagy konkrét id
     parser.add_argument("--delete-id", default="PRODUCT_EXTEND_ID_HERE", help="Delete preview ID placeholder")
+
+    # sku_map preview GET requestek száma
     parser.add_argument("--sku-map-pages", type=int, default=1, help="How many SKU_MAP preview GET requests to write")
 
     args = parser.parse_args()
@@ -256,26 +262,66 @@ def main() -> None:
     if verbose:
         print(f"PROCESSING: {len(natura_products)} product(s)")
 
-    # 2) Haldepó enrich merge + plugin indexes
-    merged_products = natura_products  # default: no enrich
-    plugins: list[WholesalePlugin] = []
-    plugin_indexes: dict[str, dict[str, Any]] = {}
+    # -------------------------------------------------
+    # 2) ENRICH plugins (all) + supplier rows cache
+    # -------------------------------------------------
+    enrich_mode = (args.enrich or "").strip().lower()
 
-    if args.with_haldepo:
-        haldepo_rows = load_products("haldepo", verbose=verbose)
+    enrich_plugins = []
+    if enrich_mode == "all":
+        from src.merge.rules.enrich_registry import get_all_enrich_plugins
+        enrich_plugins = get_all_enrich_plugins()
 
-        # match_key alapú enrich merge a meglévő merge rétegeddel
-        master_keys = build_master_keys(natura_products)
-        haldepo_by_key = index_enricher_by_key(haldepo_rows, master_keys)
-        merged_products = merge_master_with_enricher(natura_products, haldepo_by_key)
+    # ✅ ugyanazt a master key logikát használjuk, mint a régi merge motor
+    from src.merge.merge_products import build_master_keys, index_enricher_by_key
+    master_keys = build_master_keys(natura_products)
 
-        # wholesale override plugin (csak ár CSV-hez)
-        plugins.append(HaldepoWholesalePlugin())
-        # NOTE: itt Haldepó rows megy be, később pluginonként a saját rows
-        for plg in plugins:
-            plugin_indexes[plg.name] = plg.build_indexes(haldepo_rows)
+    # supplier rows cache: egy beszállító CSV-t csak egyszer töltsünk+normalizáljunk
+    supplier_rows_cache: dict[str, list[dict[str, Any]]] = {}
+    enrich_indexes: dict[str, dict[str, Any]] = {}
 
-    # 3) Output fájlok
+    if enrich_plugins:
+        for plg in enrich_plugins:
+            sname = plg.supplier_name()
+
+            if sname not in supplier_rows_cache:
+                supplier_rows_cache[sname] = load_products(sname, verbose=verbose)
+
+            rows = supplier_rows_cache[sname]
+
+            # ✅ bevált indexelés
+            enrich_indexes[plg.name] = index_enricher_by_key(rows, master_keys)
+
+    # -------------------------------------------------
+    # 3) WHOLESALE plugins
+    # -------------------------------------------------
+    # Jelenleg: csak Haldepó wholesale override pluginod van.
+    # Ha --enrich all, és van Haldepó, akkor engedjük a wholesale override-ot is.
+    wholesale_plugins: list[Any] = []
+    wholesale_indexes: dict[str, dict[str, Any]] = {}
+
+    try:
+        # ha a Haldepó enrich plugin benne van, akkor a Haldepó CSV úgyis be lett töltve -> használjuk wholesale-hoz is
+        has_haldepo_enrich = any(getattr(p, "name", "") == "haldepo" for p in enrich_plugins)
+        if has_haldepo_enrich:
+            from src.merge.rules.haldepo_wholesale import HaldepoWholesalePlugin
+
+            hp = HaldepoWholesalePlugin()
+            wholesale_plugins.append(hp)
+
+            # a Haldepó rows már a cache-ben vannak (ha a enrich plugin supplier_name() == "haldepo")
+            haldepo_rows = supplier_rows_cache.get("haldepo") or load_products("haldepo", verbose=verbose)
+            supplier_rows_cache.setdefault("haldepo", haldepo_rows)
+
+            wholesale_indexes[hp.name] = hp.build_indexes(haldepo_rows)
+    except Exception as e:
+        # wholesale plugin hibája ne törje el a preview-t, csak logoljuk
+        if verbose:
+            print("WARN: wholesale plugin init failed:", e)
+
+    # -------------------------------------------------
+    # 4) Output fájlok
+    # -------------------------------------------------
     out_master_create = DEBUG_DIR / "master_create_all.jsonl"
     out_master_update = DEBUG_DIR / "master_update_all.jsonl"
     out_enrich_update = DEBUG_DIR / "enrich_update_all.jsonl"
@@ -293,20 +339,36 @@ def main() -> None:
         reset_file(out_errors)
         init_csv(out_wholesale, ["sku", "model", "gross_price", "wholesale_price", "supplier"])
 
-        # 5. JSON: sku_map preview GET-ek
         for page in range(1, max(1, args.sku_map_pages) + 1):
             append_jsonl(out_sku_map, build_sku_map_preview_request(base_url=base_url, page=page, limit=200))
 
     ok_create = ok_update = ok_enrich = ok_wholesale = ok_delete = 0
     err_count = 0
 
-    # 4) Fő loop
-    # Natura master + merged (enriched) párban
-    for p_master, p_merged in zip(natura_products, merged_products):
+    # -------------------------------------------------
+    # 5) FŐ LOOP
+    # -------------------------------------------------
+    for p_master in natura_products:
         sku = str(p_master.get("sku", "")).strip()
         model = (p_master.get("model") or "").strip() or sku
 
-        # 1) MASTER_CREATE
+        # ENRICH: master -> merged (összes plugin egymás után)
+        p_merged = dict(p_master)
+        enriched_any = False
+
+        try:
+            for plg in enrich_plugins:
+                res = plg.apply(master=p_merged, indexes=enrich_indexes.get(plg.name, {}))
+                p_merged = res.merged
+                if res.enriched_by:
+                    enriched_any = True
+        except Exception as e:
+            # enrich merge hibát külön stage-ként logoljuk
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "ENRICH_MERGE", "error": str(e)})
+
+        # MASTER CREATE
         try:
             payload = {
                 "sku": sku,
@@ -314,7 +376,7 @@ def main() -> None:
                 "uri": f"{base_url}/productExtend" if base_url else "/productExtend",
                 "data": build_payload(
                     "MASTER_CREATE",
-                    p_master,
+                    p_merged,  # fontos: merged mehet create-be (képek/leírás így már összeállt)
                     language_id=LANGUAGE_ID,
                     status_value=0,
                     stock1=0,
@@ -328,7 +390,7 @@ def main() -> None:
             if args.write:
                 append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_CREATE", "error": str(e)})
 
-        # 2) MASTER_UPDATE
+        # MASTER UPDATE
         try:
             payload = {
                 "sku": sku,
@@ -336,7 +398,7 @@ def main() -> None:
                 "uri": f"{base_url}/productExtend/PRODUCT_EXTEND_ID_HERE" if base_url else "/productExtend/PRODUCT_EXTEND_ID_HERE",
                 "data": build_payload(
                     "MASTER_UPDATE",
-                    p_master,
+                    p_master,  # update-nél maradjunk a masteren (ár/státusz stb. policy szerint)
                     language_id=LANGUAGE_ID,
                 ),
             }
@@ -348,19 +410,31 @@ def main() -> None:
             if args.write:
                 append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_UPDATE", "error": str(e)})
 
-        # 3) ENRICH_UPDATE (csak ha tényleg enrich-elt valaki)
-        # A merge réteged beállítja: out["_enriched_by"] = "haldepo"
-
+        # ENRICH UPDATE (csak ha tényleg történt enrich)
         try:
-            enriched_by = (p_merged.get("_enriched_by") or "").strip()
-            if enriched_by:
+            if enriched_any:
+                # melyik plugin építse a payloadot?
+                # egyszerű policy: aki UTOLJÁRA enrich-elt (priority miatt) -> _enriched_by alapján
+                enriched_by = (p_merged.get("_enriched_by") or "").strip()
+
+                data = None
+                if enriched_by:
+                    for plg in reversed(enrich_plugins):
+                        if plg.name == enriched_by:
+                            data = plg.build_enrich_update_payload(p_merged, language_id=LANGUAGE_ID)
+                            break
+
+                if data is None:
+                    # fallback: közös builder (ha van)
+                    data = build_payload("ENRICH_UPDATE", p_merged, language_id=LANGUAGE_ID)
+
                 payload = {
                     "sku": sku,
                     "method": "PUT",
                     "uri": f"{base_url}/productExtend/PRODUCT_EXTEND_ID_HERE" if base_url else "/productExtend/PRODUCT_EXTEND_ID_HERE",
-                    "data": build_enrich_update_payload(p_merged, language_id=LANGUAGE_ID),
-                    "meta": {"enriched_by": enriched_by}, #TOD: ezt majd élesben törölni kell
+                    "data": data,
                 }
+
                 ok_enrich += 1
                 if args.write:
                     append_jsonl(out_enrich_update, payload)
@@ -369,8 +443,7 @@ def main() -> None:
             if args.write:
                 append_jsonl(out_errors, {"sku": sku, "stage": "ENRICH_UPDATE", "error": str(e)})
 
-        # 4) DELETE preview JSON (batch DELETE request sablon)
-        # Preview-ban nincs sku_map, ezért placeholder ID-t használunk.
+        # DELETE preview JSON
         try:
             del_req = build_delete_request(
                 base_url=base_url,
@@ -391,9 +464,9 @@ def main() -> None:
             wp = p_master.get("wholesale_price")
             supplier = "natura"
 
-            for plg in plugins:
-                res = plg.apply(master=p_master, indexes=plugin_indexes.get(plg.name, {}))
-                if res.supplier != "natura":
+            for plg in wholesale_plugins:
+                res = plg.apply(master=p_master, indexes=wholesale_indexes.get(plg.name, {}))
+                if getattr(res, "supplier", "natura") != "natura":
                     gp, wp, supplier = res.gross_price, res.wholesale_price, res.supplier
 
             ok_wholesale += 1

@@ -253,7 +253,11 @@ def build_enrich_update_payload(
 
     name_hu = _pick_name_hu(p)
     desc_hu = _pick_desc_hu(p)
-    main_img = _pick_main_image(p)
+
+    # ENRICH_UPDATE: nálad mainPicture = TELJES URL
+    main_img = _pick_main_image(p)  # ez nálad image_urls[0]-t ad, ami már teljes URL
+
+    model = (p.get("model") or "").strip() or sku
 
     pd: Dict[str, Any] = {
         "language_id": language_id,
@@ -266,7 +270,7 @@ def build_enrich_update_payload(
         "sku": sku,
         "productDescriptions": [pd],
         "mainPicture": main_img,
-        "imageAlt": name_hu if main_img else None,
+        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["ENRICH_UPDATE"])
