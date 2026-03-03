@@ -47,7 +47,7 @@ def clean_folder_name(value: str) -> str:
 
 
 def build_shop_image_path(csoport1: str, model: str, slot: int = 1, ext: str = ".jpg") -> str:
-    folder = clean_folder_name(csoport1)
+    folder = clean_folder_name(csoport1).lower()
     base = clean_sku(model)
 
     if not base or not folder:
@@ -61,6 +61,26 @@ def build_shop_image_path(csoport1: str, model: str, slot: int = 1, ext: str = "
     return f"product/{folder}/{fname}"
 
 
-def image_alt_from_model(model: str) -> str:
+def image_alt_from_model(name: str, model: str, *, keyword: str = "horgász termék") -> str:
+    """
+    SEO-barát ALT:
+    - tartalmazza a terméknevet (ha van)
+    - tartalmazza a modellt/cikkszámot (ha van)
+    - opcionális kulcsszó
+    """
+    name = norm_text(name)
     model = norm_text(model)
-    return f"{model} cikkszámú termék képe" if model else "termék képe"
+
+    parts = []
+    if name:
+        parts.append(name)
+    if model:
+        parts.append(model)
+
+    base = " - ".join(parts).strip()
+
+    if base and keyword:
+        return f"{base} | {keyword}"
+    if base:
+        return base
+    return "Termékkép"

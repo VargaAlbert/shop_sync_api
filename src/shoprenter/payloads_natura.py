@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, Set, Literal, Callable, TypedDict
-
+from src.utils.images import build_shop_image_path, image_alt_from_model
 
 DEFAULT_CATEGORY_ID = "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4"
 WHOLESALE_GROUP_NAME_DEFAULT = "NAGYKER"
@@ -172,7 +172,17 @@ def build_master_create_payload(
     desc_hu = _pick_desc_hu(p)
     cat_id = _resolve_category_id(p, category_id=category_id, category_map=category_map)
 
+    # 1) Natura / enrich kép (ha van)
     main_img = _pick_main_image(p)
+
+    # 2) Fallback: product/{CSOPORT1}/{model}.jpg
+    if not main_img:
+        csoport1 = (p.get("csoport1_name") or "").strip()
+        model = (p.get("model") or "").strip() or sku
+
+        generated = build_shop_image_path(csoport1, model, slot=1, ext=".jpg")
+        if generated:
+            main_img = generated
 
     pd: Dict[str, Any] = {
         "language_id": language_id,
@@ -191,7 +201,7 @@ def build_master_create_payload(
         "productDescriptions": [pd],
         "productCategoryRelations": [{"category_id": cat_id}],
         "mainPicture": main_img,
-        "imageAlt": name_hu if main_img else None,
+        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
         "_post_actions": _wholesale_post_actions(p),
     }
 
