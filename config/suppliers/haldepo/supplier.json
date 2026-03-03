@@ -1,7 +1,8 @@
 {
+  "name": "haldepo",
   "type": "csv",
   "source": {
-    "url": "https://.../haldepo.csv"
+    "url": "https://www.haldepo.hu/letoltes/csv"
   },
   "encoding": "utf-8",
   "delimiter": ";",

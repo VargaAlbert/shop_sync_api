@@ -2,8 +2,13 @@
   "name": "natura",
   "type": "csv",
   "source": {
-    "url": "file:///C:/Tarhely/shop_sync_api/data/sources/natura/webaruhaz.csv",
-    "encoding": "utf-8",
-    "delimiter": ","
+    "url": "file:///C:/Tarhely/shop_sync_api/data/sources/natura/webaruhaz.csv"
+  },
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "has_header": true,
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 86400
   }
 }

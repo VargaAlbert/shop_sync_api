@@ -9,3 +9,5 @@ Használat:
 """
 
 from . import natura  # noqa: F401
+#import src.normalize.suppliers.natura  # noqa: F401
+import src.normalize.suppliers.haldepo  # noqa: F401

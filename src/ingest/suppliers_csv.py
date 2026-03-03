@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
 import json
 import time
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from src.ingest.parsers.csv_parser import parse_csv_bytes
+from src.ingest.downloaders.generic import download_generic
+from src.ingest.downloaders.registry import get_downloader
+import src.ingest.downloaders  # bootstrap: regisztrálók betöltése (side-effect)
+
 
 # Konfigurációs mappák
 SUPPLIERS_DIR = Path("config") / "suppliers"
@@ -15,168 +18,211 @@ CACHE_DIR = Path("data") / "cache" / "suppliers"
 
 
 @dataclass(frozen=True)
+class SupplierCsvCacheConfig:
+    enabled: bool = True
+    ttl_seconds: int = 86400
+
+
+@dataclass(frozen=True)
 class SupplierCsvConfig:
     """
     Egy CSV típusú beszállító konfigurációs modellje.
-
-    Attribútumok:
-        name (str):
-            A beszállító neve.
-
-        url (str):
-            A CSV forrás URL-je.
-
-        encoding (str):
-            A CSV fájl karakterkódolása.
-            Alapértelmezett: utf-8
-
-        delimiter (str):
-            A CSV mezőelválasztó karakter.
-            Alapértelmezett: ","
     """
     name: str
     url: str
     encoding: str = "utf-8"
-    delimiter: str = ","
+    delimiter: str = ";"
+    has_header: bool = True
+    cache: SupplierCsvCacheConfig = SupplierCsvCacheConfig()
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
-    """
-    JSON fájl beolvasása és Python dict-ként való visszaadása.
-
-    Paraméter:
-        path (Path): A JSON fájl elérési útja.
-
-    Visszatérési érték:
-        Dict[str, Any]: A beolvasott JSON tartalom.
-    """
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def load_supplier_csv_config(supplier_dir: Path) -> SupplierCsvConfig:
     """
-    Egy beszállító könyvtárából betölti a CSV konfigurációt.
+    supplier.json betöltése.
 
-    A supplier.json fájlból olvassa ki az adatokat.
-    Jelenleg kizárólag 'type: csv' támogatott.
-
-    Paraméter:
-        supplier_dir (Path): A beszállító mappája.
-
-    Visszatérési érték:
-        SupplierCsvConfig: A beszállító konfigurációja.
-
-    Kivétel:
-        ValueError: Ha a beszállító típusa nem CSV.
+    Várt struktúra (ahogy nálad van):
+    {
+      "name": "haldepo",
+      "type": "csv",
+      "source": { "url": "https://..." },
+      "encoding": "utf-8",
+      "delimiter": ";",
+      "has_header": true,
+      "cache": { "enabled": true, "ttl_seconds": 86400 }
+    }
     """
     cfg = _read_json(supplier_dir / "supplier.json")
 
     if cfg.get("type", "").lower() != "csv":
         raise ValueError(f"Csak CSV támogatott most. Supplier: {supplier_dir.name}")
 
-    src = cfg["source"]
+    src = cfg.get("source") or {}
+    url = src.get("url") or ""
+    if not url:
+        raise KeyError(f"Missing source.url in {supplier_dir / 'supplier.json'}")
+
+    cache_cfg = cfg.get("cache") or {}
+    cache = SupplierCsvCacheConfig(
+        enabled=bool(cache_cfg.get("enabled", True)),
+        ttl_seconds=int(cache_cfg.get("ttl_seconds", 86400)),
+    )
 
     return SupplierCsvConfig(
-        name=cfg["name"],
-        url=src["url"],
-        encoding=src.get("encoding", "utf-8"),
-        delimiter=src.get("delimiter", ","),
+        name=str(cfg.get("name") or supplier_dir.name),
+        url=str(url),
+        encoding=str(cfg.get("encoding", "utf-8")),
+        delimiter=str(cfg.get("delimiter", ";")),
+        has_header=bool(cfg.get("has_header", True)),
+        cache=cache,
     )
 
+import csv
+import io
 
-def download_bytes(url: str, timeout_sec: int = 60) -> bytes:
+
+def parse_csv_bytes(
+    data: bytes,
+    *,
+    encoding: str = "utf-8",
+    delimiter: str = ";",
+    has_header: bool = True,
+) -> List[Dict[str, Any]]:
     """
-    Tartalom letöltése HTTP(S) URL-ről byte formátumban.
+    CSV bytes -> List[Dict[str, Any]]
 
-    Paraméterek:
-        url (str): A letöltendő CSV URL-je.
-        timeout_sec (int): Timeout másodpercben.
-
-    Visszatérési érték:
-        bytes: A letöltött fájl tartalma.
-
-    Megjegyzés:
-        Egyedi User-Agent header kerül beállításra.
+    - kezeli a UTF-8 BOM-ot
+    - delimiter paraméterezhető
+    - ha has_header=False, akkor oszlopnevek: col1, col2, ...
     """
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "shop-sync/1.0"}
-    )
+    # BOM-barát decode
+    text = data.decode(encoding, errors="replace")
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
 
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        return resp.read()
+    f = io.StringIO(text)
 
+    reader = csv.reader(f, delimiter=delimiter)
+
+    rows: List[Dict[str, Any]] = []
+
+    try:
+        first = next(reader)
+    except StopIteration:
+        return []
+
+    if has_header:
+        headers = [str(h).strip() for h in first]
+    else:
+        headers = [f"col{i+1}" for i in range(len(first))]
+        rows.append({headers[i]: first[i] for i in range(len(headers))})
+
+    for r in reader:
+        # rövidebb sor esetén pad-eljük, hosszabbnál vágjuk
+        r2 = list(r[: len(headers)]) + [""] * max(0, len(headers) - len(r))
+        rows.append({headers[i]: r2[i] for i in range(len(headers))})
+
+    return rows
 
 def cache_write(supplier_name: str, content: bytes) -> Path:
     """
     Letöltött CSV tartalom mentése cache mappába.
-
-    A fájl időbélyeg alapú néven kerül mentésre:
-        YYYYMMDD_HHMMSS.csv
-
-    Paraméterek:
-        supplier_name (str): A beszállító neve.
-        content (bytes): A mentendő CSV tartalom.
-
-    Visszatérési érték:
-        Path: A létrehozott cache fájl elérési útja.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Időbélyeg generálása
     ts = time.strftime("%Y%m%d_%H%M%S")
-
     path = CACHE_DIR / supplier_name / f"{ts}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-
     path.write_bytes(content)
-
     return path
 
 
+def _download_supplier_csv(*, supplier_name: str, url: str, timeout_sec: int = 120) -> bytes:
+    """
+    Registry-s letöltés:
+    - ha van supplier-specifikus downloader -> azt használja
+    - különben generic downloader
+    """
+    fn = get_downloader(supplier_name)
+    if fn is None:
+        return download_generic(url, timeout_sec=timeout_sec)
+    return fn(url, timeout_sec)
+
+
+def _get_latest_cache_file(supplier_name: str) -> Optional[Path]:
+    supplier_cache_dir = CACHE_DIR / supplier_name
+    if not supplier_cache_dir.exists():
+        return None
+
+    files = sorted(
+        supplier_cache_dir.glob("*.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    return files[0] if files else None
+
+
+def _is_cache_fresh(path: Path, ttl_seconds: int) -> bool:
+    age = time.time() - path.stat().st_mtime
+    return age <= ttl_seconds
+
+
 def ingest_one_supplier_csv(supplier_name: str) -> List[Dict[str, Any]]:
-    """
-    Egyetlen CSV beszállító teljes ingest folyamata.
-
-    Lépések:
-        1. Konfiguráció betöltése
-        2. CSV letöltése
-        3. Cache-be mentés
-        4. CSV parse-olása
-        5. Metaadat (_supplier) hozzáadása minden sorhoz
-
-    Paraméter:
-        supplier_name (str): A beszállító mappájának neve.
-
-    Visszatérési érték:
-        List[Dict[str, Any]]:
-            A CSV sorok listája, kiegészítve _supplier mezővel.
-
-    Kivétel:
-        FileNotFoundError: Ha a beszállító mappa nem létezik.
-    """
     supplier_dir = SUPPLIERS_DIR / supplier_name
-
     if not supplier_dir.exists():
         raise FileNotFoundError(f"Nincs ilyen mappa: {supplier_dir}")
 
-    # Konfiguráció betöltése
     cfg = load_supplier_csv_config(supplier_dir)
 
-    # CSV letöltése
-    data = download_bytes(cfg.url)
+    test_mode = (os.getenv("TEST_MODE") or "").strip() == "1"
 
-    # Cache mentés
-    cache_write(cfg.name, data)
+    data: bytes
 
-    # CSV parse-olása
+    # ------------------------------------------------
+    # TEST MODE: cache-ből dolgozzunk, ha friss
+    # ------------------------------------------------
+    if test_mode and cfg.cache.enabled:
+        latest_cache = _get_latest_cache_file(cfg.name)
+
+        if latest_cache and _is_cache_fresh(latest_cache, cfg.cache.ttl_seconds):
+            print(f"[{cfg.name}] TEST MODE cache HIT → {latest_cache.name}")
+            data = latest_cache.read_bytes()
+        else:
+            print(f"[{cfg.name}] TEST MODE cache MISS → downloading")
+            data = _download_supplier_csv(
+                supplier_name=cfg.name,
+                url=cfg.url,
+                timeout_sec=120,
+            )
+            cache_write(cfg.name, data)
+
+    # ------------------------------------------------
+    # NORMAL MODE (marad a jelenlegi logika)
+    # ------------------------------------------------
+    else:
+        data = _download_supplier_csv(
+            supplier_name=cfg.name,
+            url=cfg.url,
+            timeout_sec=120,
+        )
+
+        if cfg.cache.enabled:
+            cache_write(cfg.name, data)
+
+    # ------------------------------------------------
+    # CSV parse
+    # ------------------------------------------------
     rows = parse_csv_bytes(
         data,
         encoding=cfg.encoding,
         delimiter=cfg.delimiter,
+        has_header=cfg.has_header,
     )
 
-    # Minimális meta hozzáadása merge/logika céljából
     for r in rows:
         r["_supplier"] = cfg.name
 
@@ -186,13 +232,6 @@ def ingest_one_supplier_csv(supplier_name: str) -> List[Dict[str, Any]]:
 def ingest_all_suppliers_csv() -> List[Dict[str, Any]]:
     """
     Az összes CSV típusú beszállító ingest folyamata.
-
-    A config/suppliers mappában végigiterál,
-    és minden 'type: csv' beszállítót feldolgoz.
-
-    Visszatérési érték:
-        List[Dict[str, Any]]:
-            Az összes beszállító összes sora egyetlen listában.
     """
     if not SUPPLIERS_DIR.exists():
         return []
@@ -200,12 +239,14 @@ def ingest_all_suppliers_csv() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
     for d in SUPPLIERS_DIR.iterdir():
-        if d.is_dir() and (d / "supplier.json").exists():
+        if not d.is_dir():
+            continue
+        supplier_json = d / "supplier.json"
+        if not supplier_json.exists():
+            continue
 
-            cfg = _read_json(d / "supplier.json")
-
-            # Jelenleg csak CSV támogatott
-            if cfg.get("type", "").lower() == "csv":
-                out.extend(ingest_one_supplier_csv(d.name))
+        cfg = _read_json(supplier_json)
+        if cfg.get("type", "").lower() == "csv":
+            out.extend(ingest_one_supplier_csv(d.name))
 
     return out

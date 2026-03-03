@@ -1,301 +1,302 @@
 from __future__ import annotations
 
-"""
-shoprenter.payloads_natura
-=========================
-
-Natura normalizált termék -> Shoprenter productExtend payload építése.
-
-Feladat
--------
-Ez a modul a normalize réteg által előállított Natura "Product-szerű" dict-ekből
-Shoprenter API kompatibilis payloadot készít.
-
-Két fő funkció:
-1) build_product_extend_from_natura(...)
-   - FULL payload CREATE művelethez (POST /productExtend)
-   - opcionálisan tartalmaz képet, kategóriát, gyártót, áfakulcsot
-
-2) build_update_payload_from_full(...)
-   - a FULL payloadból csak az UPDATE-hez szükséges mezőket hagyja meg
-     (PUT /productExtend/{id})
-
-Miért kell külön update payload?
---------------------------------
-Sok API-nál kockázatos a teljes create payloadot PUT-tal elküldeni, mert:
-- felülírhat olyan mezőket, amit nem akarsz módosítani
-- bizonyos mezők csak create-nél érvényesek
-Ezért UPDATE-nél célszerű minimalizált mezőkészletet küldeni.
-
-Képútvonal kezelés
-------------------
-A build_product_extend_from_natura() a src.utils.images modul segédfüggvényeire támaszkodik:
-- build_shop_image_path(csoport1, model, slot)
-- image_alt_from_model(model)
-
-Elv:
-- mappa név = csoport1 (Natura CSOPORT1)
-- fájlnév = model (vagy SKU fallback)
-"""
-
-from typing import Any, Dict, Optional, Mapping
-from src.utils.images import build_shop_image_path, image_alt_from_model
+from typing import Any, Dict, Mapping, Optional, Set, Literal, Callable, TypedDict
 
 
-# Alapértelmezett kategória, ha nincs (vagy nincs bekötve) category_map.
 DEFAULT_CATEGORY_ID = "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4"
-
-
-# UPDATE esetén csak ezt a pár mezőt küldjük (biztonságosabb).
-UPDATE_FIELDS = {
-    "sku",
-    "price",
-    "gtin",
-    "modelNumber",
-    "productDescriptions",
-    "customer_group_prices",
-    "_post_actions"
-}
-
-
-from typing import Any, Dict, Optional, Mapping, List, TypedDict
-
 WHOLESALE_GROUP_NAME_DEFAULT = "NAGYKER"
 
 
-class CustomerGroupPriceIntent(TypedDict, total=False):
-    customer_group_name: str
-    price: str  # Shoprenter stringként szereti
+PayloadMode = Literal[
+    "MASTER_CREATE",
+    "MASTER_UPDATE",
+    "ENRICH_UPDATE",
+    "WHOLESALE_PRICE_UPDATE",
+]
 
 
-def build_customer_group_product_price_payload(
-    *,
-    product_id: str,
-    customer_group_id: str,
-    price: float,
-) -> Dict[str, Any]:
-    """
-    Customer Group Product Price payload (POST/PUT /customerGroupProductPrices)
+# -----------------------------
+# Field sets
+# -----------------------------
+class PayloadFieldSets(TypedDict):
+    MASTER_CREATE: Set[str]
+    MASTER_UPDATE: Set[str]
+    ENRICH_UPDATE: Set[str]
+    WHOLESALE_PRICE_UPDATE: Set[str]
 
-    Fixture alapján:
-      {
-        "price": "4237.5",
-        "customerGroup": {"id": "..."},
-        "product": {"id": "..."}
-      }
-    """
-    return {
-        "price": f"{float(price):.4f}",
-        "customerGroup": {"id": customer_group_id},
-        "product": {"id": product_id},
-    }
 
-def build_update_payload_from_full(full_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Full CREATE payload -> minimal UPDATE payload.
+PAYLOAD_FIELDS: PayloadFieldSets = {
+    "MASTER_CREATE": {
+        "sku",
+        "modelNumber",
+        "gtin",
+        "price",
+        "status",
+        "stock1",
+        "productDescriptions",
+        "productCategoryRelations",
+        "_post_actions",
+        "mainPicture",
+        "imageAlt",
+    },
+    "MASTER_UPDATE": {
+        "sku",
+        "modelNumber",
+        "gtin",
+        "price",
+        "productDescriptions",
+        "_post_actions",
+    },
+    "ENRICH_UPDATE": {
+        "sku",
+        "productDescriptions",
+        "mainPicture",
+        "imageAlt",
+    },
+    "WHOLESALE_PRICE_UPDATE": {
+        "sku",
+        "modelNumber",
+        "price",
+        "_post_actions",
+    },
+}
 
-    Cél:
-        A build_product_extend_from_natura() által épített teljes payloadból
-        csak azokat a mezőket tartja meg, amiket UPDATE-nél valóban küldeni akarsz.
 
-    Paraméter:
-        full_payload (Dict[str, Any]):
-            A teljes create payload.
+# -----------------------------
+# Helpers
+# -----------------------------
+def filter_payload(data: Dict[str, Any], fields: Set[str]) -> Dict[str, Any]:
+    return {k: v for k, v in data.items() if k in fields and v is not None}
 
-    Visszatérési érték:
-        Dict[str, Any]:
-            Csak az UPDATE_FIELDS-ben szereplő kulcsok, None értékek nélkül.
 
-    Megjegyzés:
-        Ha később több mezőt akarsz frissíteni, az UPDATE_FIELDS halmazt bővítsd.
-    """
-    return {k: v for k, v in full_payload.items() if k in UPDATE_FIELDS and v is not None}
+def _fmt_price(x: float) -> str:
+    return f"{float(x):.4f}"
 
-def build_product_extend_from_natura(
+
+def _require_str(p: Dict[str, Any], key: str, *, ctx: str) -> str:
+    v = str(p.get(key, "")).strip()
+    if not v:
+        raise ValueError(f"Missing {key} ({ctx})")
+    return v
+
+
+def _pick_name_hu(p: Dict[str, Any]) -> str:
+    for k in ("name_hu", "product_name_hu", "name", "title_hu"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+    return _require_str(p, "sku", ctx="name_fallback")
+
+
+def _pick_desc_hu(p: Dict[str, Any]) -> str:
+    for k in ("description_hu", "desc_hu", "description"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
+    urls = p.get("image_urls")
+    if isinstance(urls, list) and urls:
+        u0 = str(urls[0] or "").strip()
+        return u0 or None
+
+    for k in ("main_image", "image_url", "image", "mainPicture"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def _resolve_category_id(
     p: Dict[str, Any],
     *,
-    language_id: str,  # pl. "bGFuZ3VhZ2UtbGFuZ3VhZ2VfaWQ9MQ=="
+    category_id: Optional[str],
+    category_map: Optional[Mapping[str, str]],
+) -> str:
+    if category_id:
+        return category_id
+
+    if category_map:
+        for k in ("category", "category_name", "group1", "CSOPORT1"):
+            name = (p.get(k) or "").strip()
+            if name and name in category_map:
+                return category_map[name]
+
+    for k in ("category_id", "shoprenter_category_id"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+
+    return DEFAULT_CATEGORY_ID
+
+
+def _wholesale_post_actions(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    wholesale = p.get("wholesale_price")
+    if wholesale is None:
+        return None
+
+    return {
+        "customer_group_prices": [
+            {
+                "customer_group_name": WHOLESALE_GROUP_NAME_DEFAULT,
+                "price": _fmt_price(float(wholesale)),
+            }
+        ]
+    }
+
+
+# -----------------------------
+# Builder-ek
+# -----------------------------
+def build_master_create_payload(
+    p: Dict[str, Any],
+    *,
+    language_id: str,
     status_value: int = 0,
     stock1: int = 0,
-    manufacturer_id: Optional[str] = None,
-    tax_class_id: Optional[str] = None,
-    # Kategória választás:
     category_id: Optional[str] = None,
-    category_map: Optional[Mapping[str, str]] = None,  # pl. {"Etetőanyag": "Y2F0ZW..."}
-    # Kép:
-    image_slot: int = 1,
+    category_map: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Natura normalizált termékből Shoprenter productExtend FULL payloadot épít.
-
-    Bemenet:
-        p (Dict[str, Any]):
-            A normalize réteg által előállított Natura termék dict.
-            Elvárt mezők (minimum):
-                - sku (kötelező)
-                - name_hu (kötelező)
-                - gross_price (kötelező)
-            Opcionális:
-                - model
-                - gtin
-                - unit_name, manufacturer_name, tax_class_id, wholesale_price
-                - csoport1_name (vagy CSOPORT1)
-
-    Paraméterek:
-        language_id (str):
-            Shoprenter language id (pl. HU), amit a productDescriptions-nél használunk.
-
-        status_value (int):
-            Termék státusz (Shoprenter logika szerint: 0 tiltott / 1 aktív, stb).
-            Stringgé konvertálva kerül payloadba.
-
-        stock1 (int):
-            Készlet mező (Shoprenter "stock1"). Stringgé konvertálva kerül payloadba.
-
-        manufacturer_id (Optional[str]):
-            Ha megadod, a payload tartalmazni fogja:
-                "manufacturer": {"id": manufacturer_id}
-
-        tax_class_id (Optional[str]):
-            Ha megadod, a payload tartalmazni fogja:
-                "taxClass": {"id": tax_class_id}
-
-        category_id (Optional[str]):
-            Ha fix kategóriát akarsz, add meg közvetlenül.
-            Ha meg van adva, elsőbbséget élvez a category_map-pel szemben.
-
-        category_map (Optional[Mapping[str, str]]):
-            CSOPORT1 -> category_id map.
-            Ha nincs category_id és van category_map, akkor a
-            p["csoport1_name"] (vagy p["CSOPORT1"]) alapján választ.
-
-        image_slot (int):
-            Kép slot (ha több képnév/variáns van). Jelenleg a build_shop_image_path
-            slot paraméterét vezérli.
-
-    Visszatérési érték:
-        Dict[str, Any]:
-            Shoprenter POST /productExtend kompatibilis payload.
-
-    Kivétel:
-        ValueError:
-            Ha hiányzik a sku / name_hu / gross_price.
-
-    Kép kezelés:
-        - image_path = build_shop_image_path(csoport1, model, slot=image_slot)
-        - image_alt = image_alt_from_model(model)
-        - ezek a payloadba mainPicture + imageAlt mezőként kerülnek
-
-    Megjegyzés:
-        A "_debug" mező nem Shoprenter standard mező.
-        Ha az API elutasít ismeretlen mezőket (400), akkor ezt töröld/kapcsold ki.
-    """
-
-    # -----------------------------
-    # Kötelező mezők ellenőrzése
-    # -----------------------------
-    sku = str(p.get("sku", "")).strip()
-    if not sku:
-        raise ValueError("Missing sku")
-
-    name_hu = (p.get("name_hu") or "").strip()
-    if not name_hu:
-        raise ValueError(f"Missing name_hu for sku={sku}")
+    sku = _require_str(p, "sku", ctx="master_create")
 
     gross = p.get("gross_price")
     if gross is None:
-        raise ValueError(f"Missing gross_price for sku={sku}")
+        raise ValueError(f"Missing gross_price (master_create sku={sku})")
 
-    # Modell/cikkszám alap: ha van külön "model", azt preferáljuk, különben sku
     model = (p.get("model") or "").strip() or sku
+    gtin = (p.get("gtin") or p.get("ean") or "").strip() or None
 
-    # Natura csoport mező (kategória / kép mappa)
-    csoport1 = (p.get("csoport1_name") or p.get("CSOPORT1") or "").strip()
+    name_hu = _pick_name_hu(p)
+    desc_hu = _pick_desc_hu(p)
+    cat_id = _resolve_category_id(p, category_id=category_id, category_map=category_map)
 
-    # -----------------------------
-    # Kategória ID kiválasztása
-    # -----------------------------
-    # Prioritás:
-    # 1) category_id paraméter (fix)
-    # 2) category_map (CSOPORT1 alapján)
-    # 3) DEFAULT_CATEGORY_ID
-    resolved_category_id = category_id
-    if not resolved_category_id and category_map and csoport1:
-        resolved_category_id = category_map.get(csoport1)
-    if not resolved_category_id:
-        resolved_category_id = DEFAULT_CATEGORY_ID
+    main_img = _pick_main_image(p)
 
-    # -----------------------------
-    # Képútvonal + alt generálás
-    # -----------------------------
-    # Folder = csoport1, filename = model (slot szerint)
-    image_path = build_shop_image_path(
-        csoport1=csoport1,
-        model=model,
-        slot=image_slot,
-    )
-    image_alt = image_alt_from_model(model)
+    pd: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        pd["description"] = desc_hu
 
-    # -----------------------------
-    # Payload összeállítás
-    # -----------------------------
     payload: Dict[str, Any] = {
         "sku": sku,
-
-        # Ha az API nem fogadja el, később kivesszük / átnevezzük
         "modelNumber": model,
-        "gtin": (p.get("gtin") or "").strip(),
-
-        # Shoprenter gyakran stringet vár
-        "price": f"{float(gross):.4f}",
-        "status": str(int(status_value)),
-        "stock1": str(int(stock1)),
-
-        # Leírások (név nyelvhez kötve)
-        "productDescriptions": [
-            {
-                "name": name_hu,
-                "language": {"id": language_id},
-            }
-        ],
-
-        # Kategória reláció
-        "productCategoryRelations": [{"category": {"id": resolved_category_id}}],
+        "gtin": gtin,
+        "price": _fmt_price(float(gross)),
+        "status": int(status_value),
+        "stock1": int(stock1),
+        "productDescriptions": [pd],
+        "productCategoryRelations": [{"category_id": cat_id}],
+        "mainPicture": main_img,
+        "imageAlt": name_hu if main_img else None,
+        "_post_actions": _wholesale_post_actions(p),
     }
 
-    # --- vevőcsoport ár intent (NAGYKER) ---
-    wholesale = p.get("wholesale_price")
-    if wholesale is not None:
-        payload["_post_actions"] = {
-            "customer_group_prices": [
-                {
-                    "customer_group_name": WHOLESALE_GROUP_NAME_DEFAULT,
-                    "price": f"{float(wholesale):.4f}",
-                }
-            ]
-        }
+    return filter_payload(payload, PAYLOAD_FIELDS["MASTER_CREATE"])
 
-    # Kép mezők: mainPicture + imageAlt
-    # (Ha az API create-nél sem fogadja, később külön image endpointtal kell feltölteni.)
-    if image_path:
-        payload["mainPicture"] = image_path
-        payload["imageAlt"] = image_alt
 
-    # Opcionális kapcsolt mezők
-    if manufacturer_id:
-        payload["manufacturer"] = {"id": manufacturer_id}
+def build_master_update_payload(
+    p: Dict[str, Any],
+    *,
+    language_id: str,
+) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="master_update")
 
-    if tax_class_id:
-        payload["taxClass"] = {"id": tax_class_id}
+    gross = p.get("gross_price")
+    if gross is None:
+        raise ValueError(f"Missing gross_price (master_update sku={sku})")
 
-    # Debug mezők: API-k gyakran elutasítják az ismeretlen kulcsokat.
-    # Ha 400-as hibát kapsz "unknown field" jelleggel, ezt töröld vagy feltételessé tedd.
-    payload["_debug"] = {
-        "unit_name": (p.get("unit_name") or "").strip(),
-        "manufacturer_name": (p.get("manufacturer_name") or "").strip(),
-        "tax_class_raw": (p.get("tax_class_id") or "").strip(),
-        "wholesale_price": p.get("wholesale_price"),
-        "csoport1": csoport1,
+    model = (p.get("model") or "").strip() or sku
+    gtin = (p.get("gtin") or p.get("ean") or "").strip() or None
+
+    name_hu = _pick_name_hu(p)
+    desc_hu = _pick_desc_hu(p)
+
+    pd: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        pd["description"] = desc_hu
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "modelNumber": model,
+        "gtin": gtin,
+        "price": _fmt_price(float(gross)),
+        "productDescriptions": [pd],
+        "_post_actions": _wholesale_post_actions(p),
     }
 
-    return payload
+    return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
+
+
+def build_enrich_update_payload(
+    p: Dict[str, Any],
+    *,
+    language_id: str,
+) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="enrich_update")
+
+    name_hu = _pick_name_hu(p)
+    desc_hu = _pick_desc_hu(p)
+    main_img = _pick_main_image(p)
+
+    pd: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        pd["description"] = desc_hu
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "productDescriptions": [pd],
+        "mainPicture": main_img,
+        "imageAlt": name_hu if main_img else None,
+    }
+
+    return filter_payload(payload, PAYLOAD_FIELDS["ENRICH_UPDATE"])
+
+
+def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="wholesale_price_update")
+
+    gross = p.get("gross_price")
+    if gross is None:
+        raise ValueError(f"Missing gross_price (wholesale_price_update sku={sku})")
+
+    model = (p.get("model") or "").strip() or sku
+
+    post_actions = _wholesale_post_actions(p)
+    if not post_actions:
+        raise ValueError(f"Missing wholesale_price (wholesale_price_update sku={sku})")
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "modelNumber": model,
+        "price": _fmt_price(float(gross)),
+        "_post_actions": post_actions,
+    }
+
+    return filter_payload(payload, PAYLOAD_FIELDS["WHOLESALE_PRICE_UPDATE"])
+
+
+# -----------------------------
+# Registry
+# -----------------------------
+_BUILDERS: Dict[PayloadMode, Callable[..., Dict[str, Any]]] = {
+    "MASTER_CREATE": build_master_create_payload,
+    "MASTER_UPDATE": build_master_update_payload,
+    "ENRICH_UPDATE": build_enrich_update_payload,
+    "WHOLESALE_PRICE_UPDATE": build_wholesale_price_update_payload,
+}
+
+
+def build_payload(mode: PayloadMode, p: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+    fn = _BUILDERS[mode]
+    data = fn(p, **kwargs)  # type: ignore[misc]
+    return filter_payload(data, PAYLOAD_FIELDS[mode])
