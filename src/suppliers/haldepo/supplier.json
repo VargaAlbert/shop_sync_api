@@ -4,11 +4,14 @@
   "source": {
     "url": "https://www.haldepo.hu/letoltes/csv"
   },
-  "encoding": "utf-8",
-  "delimiter": ";",
-  "has_header": true,
+  "csv": {
+    "encoding": "utf-8",
+    "delimiter": ";",
+    "has_header": true
+  },
   "cache": {
     "enabled": true,
-    "ttl_seconds": 86400
+    "ttl_seconds": 86400,
+    "dir": "data/cache"
   }
 }

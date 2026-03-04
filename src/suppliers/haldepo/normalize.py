@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 from src.core.model import Product
 from src.core.match_key import normalize_match_key
-from src.core.mapping import get_float, get_str, load_mapping
+from src.core.mapping import load_mapping, get_str, get_float
 
 def normalize(raw_rows: List[Dict[str, Any]]) -> List[Product]:
     """

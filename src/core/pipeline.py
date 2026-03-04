@@ -22,7 +22,6 @@ def _bootstrap() -> None:
         # ha nincs python-dotenv, nem állunk meg
         pass
 
-    import src.ingest.downloaders  # noqa: F401
     import src.suppliers  # noqa: F401
 
 
