@@ -1,1 +1,0 @@
-from .supplier_generic import normalize_rows, get_registered_suppliers

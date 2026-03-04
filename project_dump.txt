@@ -1,0 +1,4030 @@
+﻿===== PROJECT STRUCTURE =====
+Too many parameters - config
+
+
+===== FILE CONTENTS =====
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\downloaders\generic.py
+=============================
+
+from __future__ import annotations
+
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+
+import requests
+
+
+def download_generic(url: str, timeout_sec: int = 120) -> bytes:
+    """
+    Generic downloader:
+    - http/https: requests GET
+    - file:///: local file read (bytes)
+    """
+    u = (url or "").strip()
+
+    # Local file support: file:///C:/... vagy file:/...
+    if u.lower().startswith("file:"):
+        parsed = urlparse(u)
+        # Windows: parsed.path = '/C:/Tarhely/...'
+        path_str = unquote(parsed.path)
+
+        # vedd le az elejĂ©rĹ‘l a vezetĹ‘ perjelet, ha Windows drive-os
+        if len(path_str) >= 3 and path_str[0] == "/" and path_str[2] == ":":
+            path_str = path_str[1:]
+
+        p = Path(path_str)
+        if not p.exists():
+            raise FileNotFoundError(f"File URL not found: {u} -> {p}")
+
+        return p.read_bytes()
+
+    # Default: HTTP(S)
+    r = requests.get(u, headers={"User-Agent": "shop-sync/1.0"}, timeout=timeout_sec)
+    r.raise_for_status()
+    return r.content
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\downloaders\haldepo.py
+=============================
+
+from __future__ import annotations
+import os
+import requests
+
+from src.ingest.downloaders.registry import register_downloader
+
+
+@register_downloader("haldepo")
+def download_haldepo(url: str, timeout_sec: int = 120) -> bytes:
+    user = os.getenv("HALDEPO_USER", "")
+    password = os.getenv("HALDEPO_PASS", "")
+    if not user or not password:
+        raise RuntimeError("HALDEPO_USER / HALDEPO_PASS nincs beĂˇllĂ­tva a .env-ben")
+
+    r = requests.get(
+        url,
+        auth=(user, password),
+        headers={"User-Agent": "shop-sync/1.0"},
+        timeout=timeout_sec,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\downloaders\registry.py
+=============================
+
+from __future__ import annotations
+from typing import Callable, Dict, Optional
+
+DownloaderFn = Callable[[str, int], bytes]  # (url, timeout_sec) -> bytes
+
+_DOWNLOADERS: Dict[str, DownloaderFn] = {}
+
+
+class UnknownDownloaderError(ValueError):
+    pass
+
+
+def register_downloader(name: str):
+    if not name or not name.strip():
+        raise ValueError("downloader name cannot be empty")
+    key = name.strip().lower()
+
+    def _decorator(fn: DownloaderFn) -> DownloaderFn:
+        _DOWNLOADERS[key] = fn
+        return fn
+
+    return _decorator
+
+
+def get_downloader(supplier_name: str) -> Optional[DownloaderFn]:
+    return _DOWNLOADERS.get((supplier_name or "").strip().lower())
+
+
+def list_downloaders() -> list[str]:
+    return sorted(_DOWNLOADERS.keys())
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\downloaders\__init__.py
+=============================
+
+from .registry import register_downloader, get_downloader, list_downloaders
+
+# import side effects: regisztrĂˇljĂˇk magukat
+from . import haldepo  # noqa: F401
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\parsers\csv_parser.py
+=============================
+
+import csv
+from io import StringIO
+from typing import Any, Dict, List
+
+
+def parse_csv_bytes(
+    data: bytes,
+    *,
+    encoding: str = "utf-8",
+    delimiter: str = ",",
+) -> List[Dict[str, Any]]:
+    """
+    CSV fĂˇjl feldolgozĂˇsa byte formĂˇtumbĂłl.
+
+    A fĂĽggvĂ©ny egy byte formĂˇtumban kapott CSV ĂˇllomĂˇnyt alakĂ­t Ăˇt
+    Python szĂłtĂˇrak listĂˇjĂˇvĂˇ. A fejlĂ©c sor alapjĂˇn kulcs-Ă©rtĂ©k
+    pĂˇrokat hoz lĂ©tre minden egyes adatsorhoz.
+
+    Tipikus felhasznĂˇlĂˇs:
+        - FastAPI UploadFile.read()
+        - API-n keresztĂĽl kapott CSV tartalom
+        - hĂˇttĂ©rfolyamatban tĂ¶rtĂ©nĹ‘ CSV import
+
+    ParamĂ©terek:
+        data (bytes):
+            A CSV fĂˇjl teljes tartalma byte formĂˇtumban.
+
+        encoding (str, alapĂ©rtelmezett: "utf-8"):
+            A fĂˇjl karakterkĂłdolĂˇsa. HibĂˇs karakterek esetĂ©n
+            a rendszer nem dob kivĂ©telt, hanem lecserĂ©li azokat.
+
+        delimiter (str, alapĂ©rtelmezett: ","):
+            A CSV mezĹ‘elvĂˇlasztĂł karaktere (pl. ",", ";", "\t").
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        List[Dict[str, Any]]:
+            Egy lista, amelyben minden elem egy CSV sor.
+            A kulcsok a fejlĂ©c oszlopnevei,
+            az Ă©rtĂ©kek az adott sor cellaĂ©rtĂ©kei (stringkĂ©nt).
+
+    MegjegyzĂ©sek:
+        - Minden mezĹ‘ string tĂ­pusĂş lesz.
+        - TĂ­puskonverziĂłt kĂĽlĂ¶n kell vĂ©gezni (pl. int(), float()).
+        - A CSV-nek tartalmaznia kell fejlĂ©c sort.
+        - Ăśres mezĹ‘k ĂĽres stringkĂ©nt ("") jelennek meg.
+    """
+
+    # Byte adat dekĂłdolĂˇsa szĂ¶veggĂ© a megadott encoding szerint.
+    # HibĂˇs karakterek esetĂ©n nem dob hibĂˇt, hanem lecserĂ©li azokat.
+    text = data.decode(encoding, errors="replace")
+
+    # A szĂ¶veget egy memĂłriabeli "fĂˇjllĂˇ" alakĂ­tjuk,
+    # hogy a csv.DictReader fĂˇjlkĂ©nt tudja kezelni.
+    f = StringIO(text)
+
+    # DictReader hasznĂˇlata:
+    # - Az elsĹ‘ sort fejlĂ©cnek tekinti
+    # - Minden tovĂˇbbi sort dict formĂˇban ad vissza
+    reader = csv.DictReader(f, delimiter=delimiter)
+
+    # A reader iterĂˇlhatĂł objektum, ezĂ©rt listĂˇba gyĹ±jtjĂĽk.
+    # Minden sorbĂłl explicit dict-et kĂ©szĂ­tĂĽnk.
+    return [dict(row) for row in reader]
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\parsers\__init__.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\suppliers_csv.py
+=============================
+
+from __future__ import annotations
+
+import os
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from src.ingest.downloaders.generic import download_generic
+from src.ingest.downloaders.registry import get_downloader
+import src.ingest.downloaders  # bootstrap: regisztrĂˇlĂłk betĂ¶ltĂ©se (side-effect)
+
+
+# KonfigurĂˇciĂłs mappĂˇk
+SUPPLIERS_DIR = Path("config") / "suppliers"
+CACHE_DIR = Path("data") / "cache" / "suppliers"
+
+
+@dataclass(frozen=True)
+class SupplierCsvCacheConfig:
+    enabled: bool = True
+    ttl_seconds: int = 86400
+
+
+@dataclass(frozen=True)
+class SupplierCsvConfig:
+    """
+    Egy CSV tĂ­pusĂş beszĂˇllĂ­tĂł konfigurĂˇciĂłs modellje.
+    """
+    name: str
+    url: str
+    encoding: str = "utf-8"
+    delimiter: str = ";"
+    has_header: bool = True
+    cache: SupplierCsvCacheConfig = SupplierCsvCacheConfig()
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_supplier_csv_config(supplier_dir: Path) -> SupplierCsvConfig:
+    """
+    supplier.json betĂ¶ltĂ©se.
+
+    VĂˇrt struktĂşra (ahogy nĂˇlad van):
+    {
+      "name": "haldepo",
+      "type": "csv",
+      "source": { "url": "https://..." },
+      "encoding": "utf-8",
+      "delimiter": ";",
+      "has_header": true,
+      "cache": { "enabled": true, "ttl_seconds": 86400 }
+    }
+    """
+    cfg = _read_json(supplier_dir / "supplier.json")
+
+    if cfg.get("type", "").lower() != "csv":
+        raise ValueError(f"Csak CSV tĂˇmogatott most. Supplier: {supplier_dir.name}")
+
+    src = cfg.get("source") or {}
+    url = src.get("url") or ""
+    if not url:
+        raise KeyError(f"Missing source.url in {supplier_dir / 'supplier.json'}")
+
+    cache_cfg = cfg.get("cache") or {}
+    cache = SupplierCsvCacheConfig(
+        enabled=bool(cache_cfg.get("enabled", True)),
+        ttl_seconds=int(cache_cfg.get("ttl_seconds", 86400)),
+    )
+
+    return SupplierCsvConfig(
+        name=str(cfg.get("name") or supplier_dir.name),
+        url=str(url),
+        encoding=str(cfg.get("encoding", "utf-8")),
+        delimiter=str(cfg.get("delimiter", ";")),
+        has_header=bool(cfg.get("has_header", True)),
+        cache=cache,
+    )
+
+import csv
+import io
+
+
+def parse_csv_bytes(
+    data: bytes,
+    *,
+    encoding: str = "utf-8",
+    delimiter: str = ";",
+    has_header: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    CSV bytes -> List[Dict[str, Any]]
+
+    - kezeli a UTF-8 BOM-ot
+    - delimiter paramĂ©terezhetĹ‘
+    - ha has_header=False, akkor oszlopnevek: col1, col2, ...
+    """
+    # BOM-barĂˇt decode
+    text = data.decode(encoding, errors="replace")
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
+
+    f = io.StringIO(text)
+
+    reader = csv.reader(f, delimiter=delimiter)
+
+    rows: List[Dict[str, Any]] = []
+
+    try:
+        first = next(reader)
+    except StopIteration:
+        return []
+
+    if has_header:
+        headers = [str(h).strip() for h in first]
+    else:
+        headers = [f"col{i+1}" for i in range(len(first))]
+        rows.append({headers[i]: first[i] for i in range(len(headers))})
+
+    for r in reader:
+        # rĂ¶videbb sor esetĂ©n pad-eljĂĽk, hosszabbnĂˇl vĂˇgjuk
+        r2 = list(r[: len(headers)]) + [""] * max(0, len(headers) - len(r))
+        rows.append({headers[i]: r2[i] for i in range(len(headers))})
+
+    return rows
+
+def cache_write(supplier_name: str, content: bytes) -> Path:
+    """
+    LetĂ¶ltĂ¶tt CSV tartalom mentĂ©se cache mappĂˇba.
+    """
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = CACHE_DIR / supplier_name / f"{ts}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def _download_supplier_csv(*, supplier_name: str, url: str, timeout_sec: int = 120) -> bytes:
+    """
+    Registry-s letĂ¶ltĂ©s:
+    - ha van supplier-specifikus downloader -> azt hasznĂˇlja
+    - kĂĽlĂ¶nben generic downloader
+    """
+    fn = get_downloader(supplier_name)
+    if fn is None:
+        return download_generic(url, timeout_sec=timeout_sec)
+    return fn(url, timeout_sec)
+
+
+def _get_latest_cache_file(supplier_name: str) -> Optional[Path]:
+    supplier_cache_dir = CACHE_DIR / supplier_name
+    if not supplier_cache_dir.exists():
+        return None
+
+    files = sorted(
+        supplier_cache_dir.glob("*.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    return files[0] if files else None
+
+
+def _is_cache_fresh(path: Path, ttl_seconds: int) -> bool:
+    age = time.time() - path.stat().st_mtime
+    return age <= ttl_seconds
+
+
+def ingest_one_supplier_csv(supplier_name: str) -> List[Dict[str, Any]]:
+    supplier_dir = SUPPLIERS_DIR / supplier_name
+    if not supplier_dir.exists():
+        raise FileNotFoundError(f"Nincs ilyen mappa: {supplier_dir}")
+
+    cfg = load_supplier_csv_config(supplier_dir)
+
+    test_mode = (os.getenv("TEST_MODE") or "").strip() == "1"
+
+    data: bytes
+
+    # ------------------------------------------------
+    # TEST MODE: cache-bĹ‘l dolgozzunk, ha friss
+    # ------------------------------------------------
+    if test_mode and cfg.cache.enabled:
+        latest_cache = _get_latest_cache_file(cfg.name)
+
+        if latest_cache and _is_cache_fresh(latest_cache, cfg.cache.ttl_seconds):
+            print(f"[{cfg.name}] TEST MODE cache HIT â†’ {latest_cache.name}")
+            data = latest_cache.read_bytes()
+        else:
+            print(f"[{cfg.name}] TEST MODE cache MISS â†’ downloading")
+            data = _download_supplier_csv(
+                supplier_name=cfg.name,
+                url=cfg.url,
+                timeout_sec=120,
+            )
+            cache_write(cfg.name, data)
+
+    # ------------------------------------------------
+    # NORMAL MODE (marad a jelenlegi logika)
+    # ------------------------------------------------
+    else:
+        data = _download_supplier_csv(
+            supplier_name=cfg.name,
+            url=cfg.url,
+            timeout_sec=120,
+        )
+
+        if cfg.cache.enabled:
+            cache_write(cfg.name, data)
+
+    # ------------------------------------------------
+    # CSV parse
+    # ------------------------------------------------
+    rows = parse_csv_bytes(
+        data,
+        encoding=cfg.encoding,
+        delimiter=cfg.delimiter,
+        has_header=cfg.has_header,
+    )
+
+    for r in rows:
+        r["_supplier"] = cfg.name
+
+    return rows
+
+
+def ingest_all_suppliers_csv() -> List[Dict[str, Any]]:
+    """
+    Az Ă¶sszes CSV tĂ­pusĂş beszĂˇllĂ­tĂł ingest folyamata.
+    """
+    if not SUPPLIERS_DIR.exists():
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    for d in SUPPLIERS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        supplier_json = d / "supplier.json"
+        if not supplier_json.exists():
+            continue
+
+        cfg = _read_json(supplier_json)
+        if cfg.get("type", "").lower() == "csv":
+            out.extend(ingest_one_supplier_csv(d.name))
+
+    return out
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\ingest\__init__.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\rules\enrich_haldepo.py
+=============================
+
+# src/merge/rules/enrich_haldepo.py
+from __future__ import annotations
+
+from typing import Any, Dict, Optional, Sequence
+
+from src.merge.engine import EnrichPlugin, build_default_index
+
+Product = Dict[str, Any]
+
+
+def _copy_if_empty(dst: Product, src: Product, dst_key: str, src_key: str) -> None:
+    dv = dst.get(dst_key)
+    if dv is None or (isinstance(dv, str) and not dv.strip()):
+        sv = src.get(src_key)
+        if sv is not None:
+            dst[dst_key] = sv
+
+
+def _ensure_image_urls(dst: Product, src: Product) -> None:
+    # HaldepĂł: image_url or image_urls -> master.image_urls
+    urls = None
+    if isinstance(src.get("image_urls"), list) and src["image_urls"]:
+        urls = [str(x).strip() for x in src["image_urls"] if str(x).strip()]
+    else:
+        u = str(src.get("image_url") or src.get("image") or "").strip()
+        if u:
+            urls = [u]
+
+    if urls:
+        dst["image_urls"] = urls
+
+
+class HaldepoEnrichPlugin(EnrichPlugin):
+    name = "haldepo"
+
+    def build_indexes(self, supplier_rows: Sequence[Product], *, master_keys: Sequence[str]) -> Any:
+        return build_default_index(supplier_rows, master_keys=master_keys)
+
+    def find_supplier_row(self, index: Any, master: Product) -> Optional[Product]:
+        # index_enricher_by_key usually returns a callable or dict-like structure depending on your implementation.
+        # In your dump it's used like: hit = index(master)
+        try:
+            return index(master)  # type: ignore[misc]
+        except TypeError:
+            # if index is dict-like and you have a match_key in master:
+            mk = (master.get("match_key") or "").strip()
+            if mk:
+                return index.get(mk)  # type: ignore[union-attr]
+            return None
+
+    def apply(self, master: Product, supplier_row: Product) -> Product:
+        p = dict(master)
+
+        # --- text fields
+        _copy_if_empty(p, supplier_row, "name_hu", "name_hu")
+        _copy_if_empty(p, supplier_row, "name_hu", "name")
+        _copy_if_empty(p, supplier_row, "description_hu", "description_hu")
+        _copy_if_empty(p, supplier_row, "description_hu", "description")
+
+        # --- gtin/ean
+        _copy_if_empty(p, supplier_row, "gtin", "gtin")
+        _copy_if_empty(p, supplier_row, "gtin", "ean")
+
+        # --- images: HaldepĂł legyen erĹ‘s forrĂˇs
+        _ensure_image_urls(p, supplier_row)
+
+        return p
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\rules\enrich_registry.py
+=============================
+
+from __future__ import annotations
+from typing import List
+
+from src.merge.rules.enrich_haldepo import HaldepoEnrichPlugin
+
+
+def get_all_enrich_plugins() -> List[object]:
+    plugins: List[object] = [
+        HaldepoEnrichPlugin(),
+        # ide jĂ¶n majd: XyzEnrichPlugin(), AbcEnrichPlugin(), ...
+    ]
+    # priority szerint futnak (kicsitĹ‘l nagy felĂ©), ha van priority attribĂştum
+    return sorted(plugins, key=lambda p: int(getattr(p, "priority", 0)))
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\rules\haldepo_wholesale.py
+=============================
+
+from __future__ import annotations
+from typing import Any, Dict
+
+from src.merge.rules.plugins import WholesaleResult
+from src.utils.numbers import net_to_gross_rounded_5
+
+
+class HaldepoWholesalePlugin:
+    name = "haldepo"
+
+    def build_indexes(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        by_model: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            model = (r.get("modelNumber") or r.get("model") or "").strip()
+            if model:
+                by_model[model] = r
+        return {"by_model": by_model}
+
+    def apply(self, *, master: dict[str, Any], indexes: dict[str, Any]) -> WholesaleResult:
+        sku = str(master.get("sku", "")).strip()
+        model = (master.get("model") or "").strip() or sku
+
+        # Natura alap
+        gp = master.get("gross_price")
+        wp = master.get("wholesale_price")
+
+        h = indexes.get("by_model", {}).get(model)
+        if not h:
+            return WholesaleResult(
+                gross_price=float(gp) if gp is not None else None,
+                wholesale_price=float(wp) if wp is not None else None,
+                supplier="natura",
+            )
+
+        # HaldepĂł felĂĽlĂ­r
+        if h.get("gross_price") is not None:
+            gp = h["gross_price"]
+        if h.get("wholesale_price") is not None:
+            wp = h["wholesale_price"]
+
+        # HaldepĂł wholesale nĂˇlad nettĂł -> bruttĂł + 5-re felfelĂ©
+        wp_out = None if wp is None else float(net_to_gross_rounded_5(wp))
+
+        return WholesaleResult(
+            gross_price=float(gp) if gp is not None else None,
+            wholesale_price=wp_out,
+            supplier="haldepo",
+        )
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\rules\plugins.py
+=============================
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Optional, Protocol
+
+
+@dataclass(frozen=True)
+class WholesaleResult:
+    gross_price: Optional[float]
+    wholesale_price: Optional[float]
+    supplier: str
+
+
+class WholesalePlugin(Protocol):
+    name: str
+
+    def build_indexes(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        ...
+
+    def apply(self, *, master: dict[str, Any], indexes: dict[str, Any]) -> WholesaleResult:
+        ...
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\rules\__init__.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\_legacy\enrich_plugins.py
+=============================
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Protocol
+
+
+@dataclass(frozen=True)
+class EnrichResult:
+    merged: Dict[str, Any]
+    enriched_by: Optional[str]  # pl. "haldepo" vagy None (ha nem tĂ¶rtĂ©nt enrich)
+
+
+class EnrichPlugin(Protocol):
+    name: str
+    priority: int  # nagyobb = kĂ©sĹ‘bb fusson (felĂĽlĂ­rhat)
+
+    def supplier_name(self) -> str:
+        """Melyik supplier rows-t kell betĂ¶lteni hozzĂˇ (ingest/normalize)."""
+        ...
+
+    def build_indexes(self, rows: list[dict[str, Any]], master_keys: set[str]) -> dict[str, Any]:
+        ...
+
+    def apply(self, *, master: dict[str, Any], indexes: dict[str, Any]) -> EnrichResult:
+        ...
+
+    def build_enrich_update_payload(self, merged: dict[str, Any], *, language_id: str) -> dict[str, Any]:
+        ...
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\engine.py
+=============================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+Product = Dict[str, Any]
+
+
+# -------------------------------------------------
+# Minimal helpers (self-contained)
+# -------------------------------------------------
+def build_master_keys(master_products: Sequence[Product]) -> List[str]:
+    """
+    MegnĂ©zi a master mintĂˇn, hogy mely kulcsok alapjĂˇn szoktunk tudni pĂˇrosĂ­tani.
+    NĂˇlad jellemzĹ‘en: match_key / model / gtin/ean.
+    """
+    # preferĂˇlt sorrend
+    candidates = ["match_key", "model", "modelNumber", "gtin", "ean", "sku"]
+    present: List[str] = []
+    for k in candidates:
+        for p in master_products[:200]:  # elĂ©g mintĂˇt nĂ©zni
+            v = p.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip():
+                present.append(k)
+                break
+            if not isinstance(v, str):
+                present.append(k)
+                break
+    # duplikĂˇciĂł kiszĹ±rĂ©s, sorrend megtartĂˇs
+    seen = set()
+    out = []
+    for k in present:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _normalize_str(x: Any) -> str:
+    return str(x or "").strip().lower()
+
+
+def index_enricher_by_key(rows: Sequence[Product], master_keys: Sequence[str]) -> Any:
+    """
+    EgyszerĹ± index: minden supplier row-hoz kĂ©pezĂĽnk kulcsot a master_keys szerint.
+    Visszaad egy callable-t: index(master_product) -> supplier_row|None
+    """
+    lookup: Dict[Tuple[str, str], Product] = {}
+
+    for r in rows:
+        for k in master_keys:
+            v = _normalize_str(r.get(k))
+            if v:
+                lookup[(k, v)] = r
+
+    def find(master: Product) -> Optional[Product]:
+        for k in master_keys:
+            v = _normalize_str(master.get(k))
+            if not v:
+                continue
+            hit = lookup.get((k, v))
+            if hit:
+                return hit
+        return None
+
+    return find
+
+
+# -------------------------------------------------
+# Engine
+# -------------------------------------------------
+@dataclass(frozen=True)
+class EnrichResult:
+    products: List[Product]
+    stats: Dict[str, Any]
+
+
+class EnrichPlugin:
+    name: str
+    priority: int = 0
+
+    def build_indexes(self, supplier_rows: Sequence[Product], *, master_keys: Sequence[str]) -> Any:
+        raise NotImplementedError
+
+    def find_supplier_row(self, index: Any, master: Product) -> Optional[Product]:
+        raise NotImplementedError
+
+    def apply(self, master: Product, supplier_row: Product) -> Product:
+        raise NotImplementedError
+
+
+def build_default_index(rows: Sequence[Product], *, master_keys: Sequence[str]) -> Any:
+    return index_enricher_by_key(list(rows), list(master_keys))
+
+
+def enrich_products(
+    *,
+    master_products: Sequence[Product],
+    supplier_data: Mapping[str, Sequence[Product]],
+    plugins: Sequence[Any],
+) -> EnrichResult:
+    master_keys = build_master_keys(list(master_products))
+
+    indexes: Dict[str, Any] = {}
+    for plg in plugins:
+        sname = getattr(plg, "name", "")
+        rows = supplier_data.get(sname) or []
+        indexes[sname] = plg.build_indexes(rows, master_keys=master_keys)
+
+    out: List[Product] = []
+    stats: Dict[str, Any] = {
+        "master_count": len(master_products),
+        "plugins": [getattr(p, "name", str(p)) for p in plugins],
+        "enriched_counts": {getattr(p, "name", str(p)): 0 for p in plugins},
+        "enriched_any": 0,
+        "master_keys": master_keys,
+    }
+
+    for m in master_products:
+        p = dict(m)
+        enriched_by: Optional[str] = None
+
+        for plg in plugins:
+            sname = getattr(plg, "name", "")
+            idx = indexes.get(sname)
+            row = plg.find_supplier_row(idx, p)
+            if not row:
+                continue
+            p = plg.apply(p, row)
+            enriched_by = sname
+            stats["enriched_counts"][sname] = stats["enriched_counts"].get(sname, 0) + 1
+
+        if enriched_by:
+            p["_enriched_by"] = enriched_by
+            stats["enriched_any"] += 1
+
+        out.append(p)
+
+    return EnrichResult(products=out, stats=stats)
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\match_key.py
+=============================
+
+#/merge/match_key.py
+from __future__ import annotations
+import re
+
+_WS = re.compile(r"[\s\-_\/]+", re.UNICODE)
+
+def normalize_match_key(value: str | None) -> str:
+    if not value:
+        return ""
+    s = value.strip().upper()
+    s = _WS.sub("", s)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\plugins.py
+=============================
+
+# src/merge/engine.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from src.merge.merge_products import build_master_keys, index_enricher_by_key
+
+Product = Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EnrichResult:
+    products: List[Product]
+    stats: Dict[str, Any]
+
+
+class EnrichPlugin:
+    """
+    Enrich plugin interface:
+    - name: supplier name (e.g. "haldepo")
+    - build_indexes: return an index that can resolve a master product -> supplier row
+    - apply: merge supplier row into master product (in-place or return new)
+    """
+    name: str
+
+    def build_indexes(
+        self,
+        supplier_rows: Sequence[Product],
+        *,
+        master_keys: Sequence[str],
+    ) -> Any:
+        raise NotImplementedError
+
+    def find_supplier_row(self, index: Any, master: Product) -> Optional[Product]:
+        raise NotImplementedError
+
+    def apply(self, master: Product, supplier_row: Product) -> Product:
+        raise NotImplementedError
+
+
+def enrich_products(
+    *,
+    master_products: Sequence[Product],
+    supplier_data: Mapping[str, Sequence[Product]],
+    plugins: Sequence[EnrichPlugin],
+) -> EnrichResult:
+    """
+    master_products: Natura master normalized list
+    supplier_data: { "haldepo": [rows...], ... }
+    plugins: in priority order (last wins if you design it that way)
+    """
+    master_keys = build_master_keys(master_products)
+
+    # build plugin indexes once
+    indexes: Dict[str, Any] = {}
+    for plg in plugins:
+        rows = supplier_data.get(plg.name) or []
+        indexes[plg.name] = plg.build_indexes(rows, master_keys=master_keys)
+
+    out: List[Product] = []
+    stats = {
+        "master_count": len(master_products),
+        "plugins": [p.name for p in plugins],
+        "enriched_counts": {p.name: 0 for p in plugins},
+        "enriched_any": 0,
+    }
+
+    for m in master_products:
+        p = dict(m)  # do not mutate original
+        enriched_by: Optional[str] = None
+
+        for plg in plugins:
+            idx = indexes[plg.name]
+            srow = plg.find_supplier_row(idx, p)
+            if not srow:
+                continue
+
+            p = plg.apply(p, srow)
+            enriched_by = plg.name
+            stats["enriched_counts"][plg.name] += 1
+
+        if enriched_by:
+            p["_enriched_by"] = enriched_by
+            stats["enriched_any"] += 1
+
+        out.append(p)
+
+    return EnrichResult(products=out, stats=stats)
+
+
+# Small helper you may reuse if you want simple indexing everywhere:
+def build_default_index(
+    rows: Sequence[Product],
+    *,
+    master_keys: Sequence[str],
+) -> Any:
+    return index_enricher_by_key(rows, list(master_keys))
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\merge\__init__.py
+=============================
+
+# src/merge/__init__.py
+__all__ = []
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\normalize\suppliers\haldepo.py
+=============================
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from src.normalize.supplier_generic import register_normalizer
+from src.normalize.mapping import load_mapping, get_float, get_str
+from src.merge.match_key import normalize_match_key
+
+
+@register_normalizer("haldepo")
+def normalize_haldepo_rows(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    HaldepĂł CSV -> normalizĂˇlt "enricher" rekordok.
+
+    KĂ¶telezĹ‘ kimenet:
+      - match_key (CikkszĂˇm normalizĂˇlt)
+    AjĂˇnlott kimenet:
+      - description_hu (TermĂ©kleĂ­rĂˇs)
+      - image_urls (TermĂ©kkĂ©p 1-3)
+      - manufacturer, gtin
+      - gross_price, wholesale_price (kĂ©sĹ‘bbi felhasznĂˇlĂˇsra)
+      - raw (debug)
+    """
+    m = load_mapping("haldepo")
+
+    out: List[Dict[str, Any]] = []
+    for r in raw_rows:
+        model = get_str(r, m, "model")
+        match_key = normalize_match_key(model)
+
+        # Ha nincs kulcs, nem tudjuk joinolni -> skip
+        if not match_key:
+            continue
+
+        # 3 kĂ©p Ă¶sszegyĹ±jtĂ©se
+        img0 = get_str(r, m, "mainPicture")
+        img1 = get_str(r, m, "image1")
+        img2 = get_str(r, m, "image2")
+        image_urls = [u for u in (img0, img1, img2) if u]
+
+        item: Dict[str, Any] = {
+            "kind": "enricher",
+            "source": "haldepo",
+
+            "match_key": match_key,
+            "model_raw": model,
+
+            "model": model,
+            "modelNumber": model,  # opcionĂˇlis, ha ezt preferĂˇlod mĂˇshol
+
+            # belsĹ‘ egysĂ©ges mezĹ‘k (ezeket fogja a merge/payload hasznĂˇlni)
+            "description_hu": get_str(r, m, "productDescriptions"),
+            "manufacturer": get_str(r, m, "manufacturer_name"),
+            "gtin": get_str(r, m, "gtin"),
+            "image_urls": image_urls,
+
+            # Ăˇrak (nem biztos hogy kell, de normalizĂˇljuk)
+            "gross_price": get_float(r, m, "gross_price"),
+            "wholesale_price": get_float(r, m, "wholesale_price"),
+
+            "raw": r,  # debug
+        }
+
+        out.append(item)
+
+    return out
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\normalize\suppliers\natura.py
+=============================
+
+from __future__ import annotations
+
+"""
+normalize.suppliers.natura
+=========================
+
+Natura beszĂˇllĂ­tĂł normalizĂˇlĂł modul.
+
+Feladat
+-------
+A Natura CSV-bĹ‘l (parse_csv_bytes -> raw_rows) Ă©rkezĹ‘ nyers sorokat egysĂ©ges belsĹ‘
+struktĂşrĂˇra alakĂ­tja, a config/suppliers/natura/mapping.json alapjĂˇn.
+
+Ez a modul *csak* Natura-specifikus dĂ¶ntĂ©seket tartalmaz:
+- mely belsĹ‘ mezĹ‘ket ĂˇllĂ­tjuk elĹ‘
+- mely mezĹ‘ kĂ¶telezĹ‘ (SKU)
+- milyen belsĹ‘ kulcsneveket hasznĂˇlunk (pl. name_hu)
+
+A kĂ¶zĂ¶s helper logika (mapping betĂ¶ltĂ©s, clean/to_float/first_value, stb.)
+a normalize.mapping modulban van.
+
+HasznĂˇlat
+---------
+1) ImportĂˇld egyszer a normalizĂˇlĂłkat (startupnĂˇl):
+       import src.normalize.suppliers
+
+2) NormalizĂˇlĂˇs:
+       from src.normalize import normalize_rows
+       normalized = normalize_rows("natura", raw_rows)
+
+Mapping elvĂˇrĂˇs
+---------------
+A mapping.json-ban az alĂˇbbi kulcsok elvĂˇrtako (minimum ezek):
+- "sku"
+- "model"
+- "gtin"
+- "name"
+- "unit_name"
+- "gross_price"
+- "wholesale_price"
+- "manufacturer_name"
+- "tax_class_id"
+- "csoport1_name"
+
+Ha valamelyik hiĂˇnyzik, a get_str/get_float KeyError-t dob (ez jĂł, mert
+konfig hibĂˇt gyorsan Ă©szreveszel).
+"""
+
+from typing import Any, Dict, List
+
+from src.normalize.mapping import get_float, get_str, load_mapping
+from src.normalize.supplier_generic import register_normalizer
+
+
+@register_normalizer("natura")
+def normalize(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Natura nyers sorok normalizĂˇlĂˇsa.
+
+    Bemenet:
+        raw_rows: List[Dict[str, Any]]
+            Nyers CSV sorok (parse_csv_bytes eredmĂ©nye).
+
+    Kimenet:
+        List[Dict[str, Any]]
+            NormalizĂˇlt "Product-szerĹ±" sorok listĂˇja.
+
+    SzabĂˇlyok:
+        - SKU kĂ¶telezĹ‘. Ha nincs SKU (vagy ĂĽres), a sor kimarad.
+        - Ărak float-tĂˇ konvertĂˇlĂłdnak, hiba esetĂ©n None.
+        - 'raw' mezĹ‘ben eltĂˇroljuk az eredeti sort debug/trace cĂ©lokra.
+
+    MegjegyzĂ©s:
+        A '_supplier' mezĹ‘t a supplier_generic.normalize_rows() opcionĂˇlisan
+        hozzĂˇ tudja adni (ensure_supplier_meta=True), de ha ingest kĂ¶zben mĂˇr
+        rĂˇĂ©gettĂ©l meta mezĹ‘t, az is ok.
+    """
+    m = load_mapping("natura")
+    out: List[Dict[str, Any]] = []
+
+    for r in raw_rows:
+        # KĂ¶telezĹ‘ azonosĂ­tĂł (merge/export alap)
+        sku = get_str(r, m, "sku")
+        if not sku:
+            continue
+
+        item: Dict[str, Any] = {
+            # Shoprenter SKU (rĂ©gi logika) - elsĹ‘dleges azonosĂ­tĂł
+            "sku": sku,
+
+            # Natura mezĹ‘k -> belsĹ‘ egysĂ©ges mezĹ‘k
+            "model": get_str(r, m, "model"),
+            "gtin": get_str(r, m, "gtin"),
+            "name_hu": get_str(r, m, "name"),
+            "unit_name": get_str(r, m, "unit_name"),
+
+            # Ăr mezĹ‘k
+            "gross_price": get_float(r, m, "gross_price"),
+            "wholesale_price": get_float(r, m, "wholesale_price"),
+
+            # EgyĂ©b meta / besorolĂˇs
+            "manufacturer_name": get_str(r, m, "manufacturer_name"),
+            "tax_class_id": get_str(r, m, "tax_class_id"),
+
+            # Ezt kĂ©sĹ‘bb felhasznĂˇlhatod kĂ©pek ĂştvonalĂˇhoz / kategĂłriĂˇhoz
+            "csoport1_name": get_str(r, m, "csoport1_name"),
+
+            # Nyers adat eltĂˇrolĂˇsa debug/trace cĂ©lokra
+            "raw": r,
+        }
+
+        out.append(item)
+
+    return out
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\normalize\suppliers\__init__.py
+=============================
+
+"""
+normalize.suppliers
+
+Ennek a package-nek az a cĂ©lja, hogy importĂˇlja a beszĂˇllĂ­tĂł specifikus
+normalizĂˇlĂł modulokat, amik regisztrĂˇljĂˇk magukat a registry-be.
+
+HasznĂˇlat:
+    import src.normalize.suppliers  # ez betĂ¶lti Ă©s regisztrĂˇlja az Ă¶sszes normalizĂˇlĂłt
+"""
+
+from . import natura  # noqa: F401
+#import src.normalize.suppliers.natura  # noqa: F401
+import src.normalize.suppliers.haldepo  # noqa: F401
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\normalize\mapping.py
+=============================
+
+from __future__ import annotations
+
+"""
+normalize.mapping
+=================
+
+Ez a modul tartalmazza a normalizĂˇlĂˇshoz szĂĽksĂ©ges *kĂ¶zĂ¶s* (supplier-fĂĽggetlen)
+eszkĂ¶zĂ¶ket:
+
+- supplier mapping betĂ¶ltĂ©se: config/suppliers/<supplier>/mapping.json
+- mezĹ‘-kivĂˇlasztĂˇs tĂ¶bb lehetsĂ©ges forrĂˇs oszlopbĂłl (prioritĂˇsos)
+- alap konverziĂłk Ă©s tisztĂ­tĂˇsok (string, float)
+
+MiĂ©rt van kĂĽlĂ¶n fĂˇjlban?
+------------------------
+A cĂ©l, hogy a supplier-specifikus normalizĂˇlĂłk (pl. normalize/suppliers/natura.py)
+csak a "milyen mezĹ‘ hova megy" logikĂˇt tartalmazzĂˇk, Ă©s ne legyen mindenhol
+duplikĂˇlt helper kĂłd.
+
+Elv:
+- ami ĂˇltalĂˇnos (bĂˇrmely suppliernĂ©l hasznĂˇlhatĂł) -> ide
+- ami beszĂˇllĂ­tĂł-specifikus -> normalize/suppliers/<supplier>.py
+"""
+
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+# A beszĂˇllĂ­tĂłk konfigurĂˇciĂłinak gyĂ¶kĂ©rmappĂˇja.
+# Itt vĂˇrjuk a mapping.json fĂˇjlokat:
+#   config/suppliers/<supplier_name>/mapping.json
+SUPPLIERS_DIR = Path("config") / "suppliers"
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    """
+    JSON fĂˇjl beolvasĂˇsa Ă©s Python dict-kĂ©nt valĂł visszaadĂˇsa.
+
+    ParamĂ©ter:
+        path (Path): A beolvasandĂł JSON fĂˇjl elĂ©rĂ©si Ăştja.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Dict[str, Any]: A JSON tartalom (dict).
+
+    KivĂ©tel:
+        FileNotFoundError: ha a fĂˇjl nem lĂ©tezik.
+        json.JSONDecodeError: ha a fĂˇjl nem valid JSON.
+    """
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_mapping(supplier_name: str) -> Dict[str, List[str]]:
+    """
+    BetĂ¶lti egy beszĂˇllĂ­tĂł mezĹ‘-mapping konfigurĂˇciĂłjĂˇt.
+
+    A mapping.json cĂ©lja, hogy megadja:
+      belsĹ‘ mezĹ‘nĂ©v -> lehetsĂ©ges forrĂˇs oszlopnevek (prioritĂˇsi sorrendben)
+
+    PĂ©lda mapping.json:
+        {
+          "sku": ["SKU", "CikkszĂˇm"],
+          "name": ["MegnevezĂ©s", "TermĂ©knĂ©v", "Name"],
+          "gross_price": ["BruttĂł Ăˇr", "Gross", "Price"]
+        }
+
+    ParamĂ©ter:
+        supplier_name (str): A beszĂˇllĂ­tĂł neve (mappanĂ©v).
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Dict[str, List[str]]: mapping dict.
+
+    MegjegyzĂ©s:
+        Ha a mapping.json-ban egy mezĹ‘ Ă©rtĂ©ke nem list (pl. string), az hibĂˇs
+        konfigurĂˇciĂłt jelez â€” ezt ebben a "v1" verziĂłban nem validĂˇljuk kĂĽlĂ¶n,
+        hanem a fogyasztĂł oldalon fog kiderĂĽlni (KeyError/TypeError).
+        Ha szeretnĂ©d, beĂ©pĂ­tĂĽnk szigorĂş validĂˇciĂłt is.
+    """
+    p = SUPPLIERS_DIR / supplier_name / "mapping.json"
+    return _read_json(p)
+
+
+def first_value(row: Dict[str, Any], keys: List[str]) -> Any:
+    """
+    Visszaadja az elsĹ‘ nem ĂĽres Ă©rtĂ©ket a megadott kulcsok (oszlopnevek) kĂ¶zĂĽl.
+
+    HasznĂˇlat:
+        first_value(row, ["SKU", "CikkszĂˇm", "ItemNo"])
+
+    ParamĂ©terek:
+        row (Dict[str, Any]): Egy nyers CSV sor (DictReader-bĹ‘l).
+        keys (List[str]): LehetsĂ©ges oszlopnevek listĂˇja prioritĂˇs szerint.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Any: Az elsĹ‘ Ă©rtĂ©k, ami nem None Ă©s nem ĂĽres string, kĂĽlĂ¶nben None.
+    """
+    for k in keys:
+        v = row.get(k)
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def clean_str(v: Any) -> str:
+    """
+    BiztonsĂˇgos string tisztĂ­tĂˇs.
+
+    SzabĂˇlyok:
+      - None vagy "" -> ""
+      - egyĂ©b -> str(v).strip()
+
+    ParamĂ©ter:
+        v (Any): Bemeneti Ă©rtĂ©k.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        str: TisztĂ­tott string.
+    """
+    return str(v).strip() if v not in (None, "") else ""
+
+
+def to_float(v: Any) -> Optional[float]:
+    """
+    Rugalmas float konverziĂł beszĂˇllĂ­tĂłi Ă©rtĂ©kekhez.
+
+    Kezelt esetek:
+      - None vagy "" -> None
+      - szĂłkĂ¶zĂ¶k eltĂˇvolĂ­tĂˇsa: "1 234,56" -> "1234,56"
+      - vesszĹ‘ -> pont: "1234,56" -> "1234.56"
+      - ha nem parse-olhatĂł -> None (nem dob kivĂ©telt)
+
+    ParamĂ©ter:
+        v (Any): Bemeneti Ă©rtĂ©k.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Optional[float]: float, vagy None, ha nem konvertĂˇlhatĂł.
+    """
+    if v in (None, ""):
+        return None
+
+    s = str(v).strip().replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def get_str(row: Dict[str, Any], mapping: Dict[str, List[str]], field: str) -> str:
+    """
+    KĂ©nyelmi fĂĽggvĂ©ny: mapping alapjĂˇn kivĂˇlasztja a mezĹ‘t Ă©s stringgĂ© tisztĂ­tja.
+
+    PĂ©lda:
+        name_hu = get_str(r, m, "name")
+
+    ParamĂ©terek:
+        row (Dict[str, Any]): Nyers sor dict.
+        mapping (Dict[str, List[str]]): load_mapping() eredmĂ©nye.
+        field (str): A belsĹ‘ mezĹ‘ neve, amit a mapping.json tartalmaz.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        str: TisztĂ­tott string ("" ha nincs Ă©rtĂ©k).
+
+    KivĂ©tel:
+        KeyError: ha a field nincs a mapping-ben.
+    """
+    return clean_str(first_value(row, mapping[field]))
+
+
+def get_float(row: Dict[str, Any], mapping: Dict[str, List[str]], field: str) -> Optional[float]:
+    """
+    KĂ©nyelmi fĂĽggvĂ©ny: mapping alapjĂˇn kivĂˇlasztja a mezĹ‘t Ă©s float-tĂˇ alakĂ­tja.
+
+    PĂ©lda:
+        gross = get_float(r, m, "gross_price")
+
+    ParamĂ©terek:
+        row (Dict[str, Any]): Nyers sor dict.
+        mapping (Dict[str, List[str]]): load_mapping() eredmĂ©nye.
+        field (str): A belsĹ‘ mezĹ‘ neve, amit a mapping.json tartalmaz.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Optional[float]: float vagy None.
+
+    KivĂ©tel:
+        KeyError: ha a field nincs a mapping-ben.
+    """
+    return to_float(first_value(row, mapping[field]))
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\normalize\supplier_generic.py
+=============================
+
+from __future__ import annotations
+
+"""
+normalize.supplier_generic
+=========================
+
+Ez a modul adja a normalizĂˇlĂˇsi rĂ©teg *egyetlen* publikus belĂ©pĂ©si pontjĂˇt:
+
+    normalize_rows(supplier_name, raw_rows)
+
+A modul egy registry (regiszter) alapĂş megoldĂˇst hasznĂˇl:
+- Minden beszĂˇllĂ­tĂł normalizĂˇlĂłja (pl. normalize/suppliers/natura.py)
+  regisztrĂˇlja magĂˇt egy nĂ©vvel.
+- A rendszer futĂˇsidĹ‘ben a supplier_name alapjĂˇn kivĂˇlasztja a megfelelĹ‘
+  normalizĂˇlĂłt.
+
+MiĂ©rt jĂł ez?
+------------
+- Ăšj beszĂˇllĂ­tĂł hozzĂˇadĂˇsa = Ăşj fĂˇjl + egy @register_normalizer dekorĂˇtor.
+- Nincs if/else lĂˇnc, nincs kĂ¶zponti mĂłdosĂ­tgatĂˇs minden Ăşj suppliernĂ©l.
+- TesztelhetĹ‘: a normalizĂˇlĂłk kĂĽlĂ¶n-kĂĽlĂ¶n unit tesztelhetĹ‘k.
+
+Alapelv:
+--------
+- normalize/suppliers/<supplier>.py: beszĂˇllĂ­tĂł specifikus "mezĹ‘ hova megy"
+- normalize/mapping.py: kĂ¶zĂ¶s helper/mapping logika
+- normalize/supplier_generic.py: registry + dispatcher
+"""
+
+from typing import Any, Callable, Dict, List, Optional
+
+
+# A normalizĂˇlĂł fĂĽggvĂ©ny tĂ­pusa:
+# Bemenet: nyers sorok (CSV dict-ek listĂˇja)
+# Kimenet: normalizĂˇlt sorok (ĂˇltalĂˇban List[Dict[str, Any]])
+NormalizerFn = Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
+
+
+# GlobĂˇlis registry: supplier_name -> normalizer fĂĽggvĂ©ny
+_NORMALIZERS: Dict[str, NormalizerFn] = {}
+
+
+class UnknownSupplierError(ValueError):
+    """
+    Akkor dobjuk, ha nincs regisztrĂˇlt normalizĂˇlĂł a megadott supplier nĂ©vhez.
+    """
+    pass
+
+
+def register_normalizer(supplier_name: str) -> Callable[[NormalizerFn], NormalizerFn]:
+    """
+    DekorĂˇtor egy normalizĂˇlĂł fĂĽggvĂ©ny regisztrĂˇlĂˇsĂˇhoz.
+
+    HasznĂˇlat a supplier modulban:
+
+        from src.normalize.supplier_generic import register_normalizer
+
+        @register_normalizer("natura")
+        def normalize(rows):
+            ...
+
+    ParamĂ©ter:
+        supplier_name (str):
+            A beszĂˇllĂ­tĂł neve, amire a normalizĂˇlĂł vonatkozik.
+            AjĂˇnlĂˇs: kisbetĹ±s, mappanĂ©vvel egyezzen.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Callable: dekorĂˇtor, ami regisztrĂˇlja a fĂĽggvĂ©nyt.
+
+    KivĂ©tel:
+        ValueError: ha ĂĽres supplier nĂ©v Ă©rkezik.
+    """
+    if not supplier_name or not supplier_name.strip():
+        raise ValueError("supplier_name nem lehet ĂĽres a normalizer regisztrĂˇciĂłhoz.")
+
+    name = supplier_name.strip().lower()
+
+    def _decorator(fn: NormalizerFn) -> NormalizerFn:
+        _NORMALIZERS[name] = fn
+        return fn
+
+    return _decorator
+
+
+def get_registered_suppliers() -> List[str]:
+    """
+    Visszaadja az Ă¶sszes regisztrĂˇlt beszĂˇllĂ­tĂł nevĂ©t (rendezve).
+
+    Hasznos debug/admin felĂĽleteken, vagy startup check-re.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        List[str]: regisztrĂˇlt supplier nevek listĂˇja.
+    """
+    return sorted(_NORMALIZERS.keys())
+
+
+def get_normalizer(supplier_name: str) -> NormalizerFn:
+    """
+    LekĂ©ri a supplier-hez tartozĂł normalizĂˇlĂł fĂĽggvĂ©nyt.
+
+    ParamĂ©ter:
+        supplier_name (str): beszĂˇllĂ­tĂł neve (pl. "natura")
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        NormalizerFn: a regisztrĂˇlt normalizĂˇlĂł fĂĽggvĂ©ny
+
+    KivĂ©tel:
+        UnknownSupplierError: ha nincs ilyen supplier regisztrĂˇlva.
+    """
+    name = (supplier_name or "").strip().lower()
+    fn = _NORMALIZERS.get(name)
+
+    if fn is None:
+        raise UnknownSupplierError(
+            f"Nincs normalizĂˇlĂł regisztrĂˇlva ehhez a supplierhez: '{supplier_name}'. "
+            f"ElĂ©rhetĹ‘: {', '.join(get_registered_suppliers()) or '(nincs)'}"
+        )
+
+    return fn
+
+
+def normalize_rows(
+    supplier_name: str,
+    raw_rows: List[Dict[str, Any]],
+    *,
+    ensure_supplier_meta: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    NormalizĂˇlja a nyers sorokat a megadott beszĂˇllĂ­tĂł szerint.
+
+    Ez az a fĂĽggvĂ©ny, amit a rendszer tĂ¶bbi rĂ©sze hĂ­v (export/merge elĹ‘tt),
+    Ă©s nem kell tudnia arrĂłl, hogy konkrĂ©tan melyik supplier modul mit csinĂˇl.
+
+    ParamĂ©terek:
+        supplier_name (str):
+            A beszĂˇllĂ­tĂł azonosĂ­tĂł neve (pl. "natura").
+            Ennek egyeznie kell a regisztrĂˇlt normalizĂˇlĂł nevĂ©vel.
+
+        raw_rows (List[Dict[str, Any]]):
+            Nyers sorok (CSV parse utĂˇn).
+
+        ensure_supplier_meta (bool):
+            Ha True, akkor ellenĹ‘rzi/rĂˇsegĂ­t, hogy minden normalizĂˇlt sorban
+            legyen '_supplier' mezĹ‘. (Merge Ă©s debug miatt hasznos.)
+            AlapĂ©rtelmezett: True
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        List[Dict[str, Any]]:
+            NormalizĂˇlt sorok listĂˇja (supplier-specifikus mapping alapjĂˇn).
+
+    KivĂ©tel:
+        UnknownSupplierError:
+            Ha nincs regisztrĂˇlt normalizĂˇlĂł.
+
+    MegjegyzĂ©s:
+        A registry mĹ±kĂ¶dĂ©sĂ©hez a supplier modulokat be kell importĂˇlni.
+        AjĂˇnlott:
+            - src/normalize/suppliers/__init__.py importĂˇlja a beszĂˇllĂ­tĂłkat
+            - a projekt belĂ©pĂ©si pontjĂˇn (pl. main.py) egyszer importĂˇld:
+                import src.normalize.suppliers
+    """
+    fn = get_normalizer(supplier_name)
+
+    # Lefuttatjuk a beszĂˇllĂ­tĂł-specifikus normalizĂˇlĂłt
+    normalized = fn(raw_rows)
+
+    # OpcionĂˇlis rĂˇsegĂ­tĂ©s: legyen _supplier meta minden sorban
+    if ensure_supplier_meta:
+        s = (supplier_name or "").strip()
+        for r in normalized:
+            r.setdefault("_supplier", s)
+
+    return normalized
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\normalize\__init__.py
+=============================
+
+from .supplier_generic import normalize_rows, get_registered_suppliers
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\runner\preview_runner.py
+=============================
+
+"""
+src/runner/preview_runner.py
+===========================
+
+đźŽŻ CĂ©l
+------
+Ez a preview runner Natura MASTER adatokbĂłl Shoprenter kompatibilis
+request payloadokat generĂˇl debug/ellenĹ‘rzĂ©si cĂ©lra.
+
+A script NEM hĂ­v API-t, csak JSONL Ă©s CSV fĂˇjlokat Ă­r.
+
+TĂˇmogatott logikai rĂ©tegek:
+  1) MASTER_CREATE   (POST /productExtend)
+  2) MASTER_UPDATE   (PUT /productExtend/{id})
+  3) ENRICH_UPDATE   (PUT /productExtend/{id})
+     - description (HaldepĂł â†’ Natura)
+     - mainPicture (HaldepĂł kĂ©p)
+     - imageAlt (SEO alt)
+     - âťŚ nem nyĂşl Ăˇrhoz
+     - âťŚ nem nyĂşl stĂˇtuszhoz
+     - âťŚ nem nyĂşl kategĂłriĂˇhoz
+  4) DELETE_PREVIEW  (DELETE /productExtend/{id})
+     - placeholder ID-val
+  5) SKU_MAP_PREVIEW (GET /productExtend?page=...)
+     - sku_map Ă©pĂ­tĂ©shez kapcsolĂłdĂł request sablon
+  + WHOLESALE CSV export (Ăˇr override plugin alapjĂˇn)
+
+------------------------------------------------------------
+đź“¦ Kimenetek (--write esetĂ©n)
+------------------------------------------------------------
+
+data/debug/payload/
+
+  master_create_all.jsonl
+  master_update_all.jsonl
+  enrich_update_all.jsonl
+  delete_all.jsonl
+  sku_map_preview_all.jsonl
+  wholesale_price_update_all.csv
+  errors.jsonl
+
+------------------------------------------------------------
+âš™ď¸Ź .env vĂˇltozĂłk
+------------------------------------------------------------
+
+SHOPRENTER_API_URL=
+    Pl.: https://your-shop.api.myshoprenter.hu
+
+TEST_PRODUCT_SKU=
+    OpcionĂˇlis default SKU szĹ±rĂ©s.
+
+------------------------------------------------------------
+đźš€ FuttatĂˇsi pĂ©ldĂˇk
+------------------------------------------------------------
+
+1) Alap preview (csak konzol summary):
+    python -m src.runner.preview_runner
+
+2) FĂˇjlba Ă­rĂˇssal:
+    python -m src.runner.preview_runner --write
+
+3) Egy konkrĂ©t SKU tesztelĂ©se:
+    python -m src.runner.preview_runner --sku 2954 --write
+
+4) ENRICH + wholesale override bekapcsolĂˇsa:
+    python -m src.runner.preview_runner --with-haldepo --write
+
+5) LimitĂˇlt elemszĂˇm:
+    python -m src.runner.preview_runner --limit 50 --write
+
+6) Csendes mĂłd:
+    python -m src.runner.preview_runner --write --quiet
+
+7) SKU_MAP preview oldalszĂˇm megadĂˇsa:
+    python -m src.runner.preview_runner --write --sku-map-pages 3
+
+8) DELETE preview ID override:
+    python -m src.runner.preview_runner --write --delete-id 123456
+
+------------------------------------------------------------
+đź§  Logikai folyamat
+------------------------------------------------------------
+
+1ď¸ŹâŁ Natura = MASTER
+    - ingest
+    - normalize
+
+2ď¸ŹâŁ HaldepĂł = ENRICHER (ha --with-haldepo)
+    - match_key alapĂş merge
+    - csak ĂĽres mezĹ‘ket mĂˇsol
+    - _enriched_by flag kerĂĽl a rekordba
+
+3ď¸ŹâŁ Payload generĂˇlĂˇs:
+    - MASTER_CREATE
+    - MASTER_UPDATE
+    - ENRICH_UPDATE (ha enrich tĂ¶rtĂ©nt)
+    - DELETE preview
+    - SKU_MAP preview
+
+4ď¸ŹâŁ Wholesale CSV:
+    - Natura alap
+    - HaldepĂł plugin felĂĽlĂ­rhat
+    - nettĂł â†’ bruttĂł
+    - 5-re kerekĂ­tĂ©s felfelĂ©
+
+------------------------------------------------------------
+đź”’ BiztonsĂˇgi megjegyzĂ©s
+------------------------------------------------------------
+
+Ez a runner NEM hĂ­v Shoprenter API-t.
+Nem mĂłdosĂ­t Ă©les adatot.
+Csak preview requesteket generĂˇl.
+
+Az Ă©les szinkron a src/shoprenter/sync.py rĂ©tegben tĂ¶rtĂ©nik.
+
+------------------------------------------------------------
+đź“ SkĂˇlĂˇzhatĂłsĂˇg
+------------------------------------------------------------
+
+A wholesale override plugin alapĂş.
+Ăšj beszĂˇllĂ­tĂł hozzĂˇadĂˇsĂˇhoz:
+
+  1) Ă­rj Ăşj plugin osztĂˇlyt (merge/rules alatt)
+  2) add hozzĂˇ a runnerben a plugin listĂˇhoz
+
+ĂŤgy a rendszer 5â€“8 beszĂˇllĂ­tĂłra is bĹ‘vĂ­thetĹ‘
+anĂ©lkĂĽl, hogy a runner szĂ©tĂˇgazna.
+
+"""
+
+from __future__ import annotations
+
+import os
+import argparse
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+from dotenv import load_dotenv
+
+from src.ingest.suppliers_csv import ingest_one_supplier_csv
+import src.normalize.suppliers  # registry bootstrap
+from src.normalize import normalize_rows
+
+from src.shoprenter.payloads_natura import build_payload
+
+from src.utils.export_debug import (
+    reset_file,
+    append_jsonl,
+    init_csv,
+    append_csv_row,
+)
+
+# NEW: clean enrich engine
+from src.merge.engine import enrich_products
+from src.merge.rules.enrich_registry import get_all_enrich_plugins
+
+from src.merge.rules.haldepo_wholesale import HaldepoWholesalePlugin  # ha mĂ©g hasznĂˇlod
+
+load_dotenv()
+
+LANGUAGE_ID = "bGFuZ3VhZ2UtbGFuZ3VhZ2UfaWQ9MQ=="
+DEBUG_DIR = Path("data/debug/payload")
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+TEST_PRODUCT_SKU = (os.getenv("TEST_PRODUCT_SKU") or "").strip()
+
+
+# -------------------------------------------------
+# LOADERS
+# -------------------------------------------------
+def load_products(supplier: str, *, verbose: bool) -> List[Dict[str, Any]]:
+    raw = ingest_one_supplier_csv(supplier)
+    products = normalize_rows(supplier, raw)
+    if verbose:
+        print(f"{supplier.upper()}: raw={len(raw)} normalized={len(products)}")
+    return products
+
+
+def safe_base_url() -> str:
+    return (os.getenv("SHOPRENTER_API_URL", "") or "").rstrip("/")
+
+
+# -------------------------------------------------
+# HELPERS: request builders (preview only)
+# -------------------------------------------------
+def build_delete_request(*, base_url: str, product_extend_id: str, sku: str) -> Dict[str, Any]:
+    return {
+        "sku": sku,
+        "method": "DELETE",
+        "uri": f"{base_url}/productExtend/{product_extend_id}" if base_url else f"/productExtend/{product_extend_id}",
+        "data": None,
+    }
+
+
+def build_sku_map_preview_request(*, base_url: str, page: int = 1, limit: int = 200) -> Dict[str, Any]:
+    uri = f"{base_url}/productExtend?page={page}&limit={limit}" if base_url else f"/productExtend?page={page}&limit={limit}"
+    return {
+        "method": "GET",
+        "uri": uri,
+        "data": None,
+        "meta": {"purpose": "sku_map_preview"},
+    }
+
+
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Shop Sync preview runner (payload + enrich + delete previews)")
+
+    parser.add_argument("--write", action="store_true", help="Write debug output files")
+    parser.add_argument("--sku", default=TEST_PRODUCT_SKU, help="Only process this SKU (or env TEST_PRODUCT_SKU)")
+    parser.add_argument("--limit", type=int, default=0, help="Limit processed products (0 = no limit)")
+    parser.add_argument("--quiet", action="store_true", help="Less console output")
+
+    # ENRICH: csak 'all' vagy ĂĽres (disabled)
+    parser.add_argument("--enrich", default="", help="Enrich mode: 'all' or empty (disabled)")
+
+    # delete previewhoz: id placeholder vagy konkrĂ©t id
+    parser.add_argument("--delete-id", default="PRODUCT_EXTEND_ID_HERE", help="Delete preview ID placeholder")
+
+    # sku_map preview GET requestek szĂˇma
+    parser.add_argument("--sku-map-pages", type=int, default=1, help="How many SKU_MAP preview GET requests to write")
+
+    args = parser.parse_args()
+    verbose = not args.quiet
+
+    base_url = safe_base_url()
+    if not base_url and verbose:
+        print("WARN: SHOPRENTER_API_URL nincs beĂˇllĂ­tva (.env). A 'uri' mezĹ‘k relative formĂˇban kĂ©szĂĽlnek.")
+
+    # 1) MASTER: Natura
+    natura_products = load_products("natura", verbose=verbose)
+
+    # SKU filter
+    sku_filter = (args.sku or "").strip()
+    if sku_filter:
+        natura_products = [p for p in natura_products if str(p.get("sku", "")).strip() == sku_filter]
+        if not natura_products:
+            raise RuntimeError(f"Nincs ilyen SKU NaturĂˇban: {sku_filter}")
+
+    if args.limit and args.limit > 0:
+        natura_products = natura_products[: args.limit]
+
+    if verbose:
+        print(f"PROCESSING: {len(natura_products)} product(s)")
+
+    # -------------------------------------------------
+    # 2) ENRICH (engine) + supplier cache
+    # -------------------------------------------------
+    enrich_mode = (args.enrich or "").strip().lower()
+    enrich_plugins = get_all_enrich_plugins() if enrich_mode == "all" else []
+
+    supplier_rows_cache: Dict[str, List[Dict[str, Any]]] = {}
+    if enrich_plugins:
+        for plg in enrich_plugins:
+            # NEW interface: plugin.name is the supplier key
+            sname = getattr(plg, "name", "")
+            if not sname:
+                raise RuntimeError(f"Invalid enrich plugin without name: {plg}")
+
+            if sname not in supplier_rows_cache:
+                supplier_rows_cache[sname] = load_products(sname, verbose=verbose)
+
+        enrich_res = enrich_products(
+            master_products=natura_products,
+            supplier_data=supplier_rows_cache,
+            plugins=enrich_plugins,
+        )
+        merged_products = enrich_res.products
+
+        if verbose:
+            print("ENRICH stats:", enrich_res.stats)
+    else:
+        merged_products = [dict(p) for p in natura_products]
+
+    # -------------------------------------------------
+    # 3) WHOLESALE plugin (maradhat kĂĽlĂ¶n, v1)
+    # -------------------------------------------------
+    wholesale_plugins: list[Any] = []
+    wholesale_indexes: dict[str, Any] = {}
+
+    try:
+        # jelen logika: ha enrichben volt haldepo, akkor tĂ¶ltsĂĽk wholesale-hoz is
+        has_haldepo = "haldepo" in supplier_rows_cache
+        if has_haldepo:
+            hp = HaldepoWholesalePlugin()
+            wholesale_plugins.append(hp)
+
+            haldepo_rows = supplier_rows_cache["haldepo"]
+            wholesale_indexes[hp.name] = hp.build_indexes(haldepo_rows)
+    except Exception as e:
+        if verbose:
+            print("WARN: wholesale plugin init failed:", e)
+
+    # -------------------------------------------------
+    # 4) Output fĂˇjlok
+    # -------------------------------------------------
+    out_master_create = DEBUG_DIR / "master_create_all.jsonl"
+    out_master_update = DEBUG_DIR / "master_update_all.jsonl"
+    out_enrich_update = DEBUG_DIR / "enrich_update_all.jsonl"
+    out_delete = DEBUG_DIR / "delete_all.jsonl"
+    out_sku_map = DEBUG_DIR / "sku_map_preview_all.jsonl"
+    out_wholesale = DEBUG_DIR / "wholesale_price_update_all.csv"
+    out_errors = DEBUG_DIR / "errors.jsonl"
+
+    if args.write:
+        reset_file(out_master_create)
+        reset_file(out_master_update)
+        reset_file(out_enrich_update)
+        reset_file(out_delete)
+        reset_file(out_sku_map)
+        reset_file(out_errors)
+        init_csv(out_wholesale, ["sku", "model", "gross_price", "wholesale_price", "supplier"])
+
+        for page in range(1, max(1, args.sku_map_pages) + 1):
+            append_jsonl(out_sku_map, build_sku_map_preview_request(base_url=base_url, page=page, limit=200))
+
+    ok_create = ok_update = ok_enrich = ok_wholesale = ok_delete = 0
+    err_count = 0
+
+    # -------------------------------------------------
+    # 5) FĹ LOOP (MASTER + ENRICH_UPDATE + DELETE + WHOLESALE CSV)
+    # -------------------------------------------------
+    # merged_products Ă©s natura_products ugyanannyi elem (enrich engine megtartja a sorrendet)
+    for p_master, p_merged in zip(natura_products, merged_products):
+        sku = str(p_master.get("sku", "")).strip()
+        model = (p_master.get("model") or "").strip() or sku
+
+        enriched_any = bool((p_merged.get("_enriched_by") or "").strip())
+
+        # MASTER CREATE (merged mehet create-be: kĂ©p/leĂ­rĂˇs beĂ©pĂĽl)
+        try:
+            payload = {
+                "sku": sku,
+                "method": "POST",
+                "uri": f"{base_url}/productExtend" if base_url else "/productExtend",
+                "data": build_payload(
+                    "MASTER_CREATE",
+                    p_merged,
+                    language_id=LANGUAGE_ID,
+                    status_value=0,
+                    stock1=0,
+                ),
+            }
+            ok_create += 1
+            if args.write:
+                append_jsonl(out_master_create, payload)
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_CREATE", "error": str(e)})
+
+        # MASTER UPDATE (policy: masterbĹ‘l)
+        try:
+            payload = {
+                "sku": sku,
+                "method": "PUT",
+                "uri": f"{base_url}/productExtend/PRODUCT_EXTEND_ID_HERE" if base_url else "/productExtend/PRODUCT_EXTEND_ID_HERE",
+                "data": build_payload(
+                    "MASTER_UPDATE",
+                    p_master,
+                    language_id=LANGUAGE_ID,
+                ),
+            }
+            ok_update += 1
+            if args.write:
+                append_jsonl(out_master_update, payload)
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_UPDATE", "error": str(e)})
+
+        # ENRICH UPDATE (csak ha tĂ©nyleg tĂ¶rtĂ©nt enrich)
+        try:
+            if enriched_any:
+                payload = {
+                    "sku": sku,
+                    "method": "PUT",
+                    "uri": f"{base_url}/productExtend/PRODUCT_EXTEND_ID_HERE" if base_url else "/productExtend/PRODUCT_EXTEND_ID_HERE",
+                    "data": build_payload("ENRICH_UPDATE", p_merged, language_id=LANGUAGE_ID),
+                }
+                ok_enrich += 1
+                if args.write:
+                    append_jsonl(out_enrich_update, payload)
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "ENRICH_UPDATE", "error": str(e)})
+
+        # DELETE preview JSON
+        try:
+            del_req = build_delete_request(
+                base_url=base_url,
+                product_extend_id=str(args.delete_id),
+                sku=sku,
+            )
+            ok_delete += 1
+            if args.write:
+                append_jsonl(out_delete, del_req)
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "DELETE_PREVIEW", "error": str(e)})
+
+        # WHOLESALE CSV (master alap, plugin felĂĽlĂ­rhat)
+        try:
+            gp = p_master.get("gross_price")
+            wp = p_master.get("wholesale_price")
+            supplier = "natura"
+
+            for plg in wholesale_plugins:
+                res = plg.apply(master=p_master, indexes=wholesale_indexes.get(plg.name, {}))
+                if getattr(res, "supplier", "natura") != "natura":
+                    gp, wp, supplier = res.gross_price, res.wholesale_price, res.supplier
+
+            ok_wholesale += 1
+            if args.write:
+                append_csv_row(
+                    out_wholesale,
+                    [
+                        sku,
+                        model,
+                        "" if gp is None else f"{float(gp):.4f}",
+                        "" if wp is None else f"{float(wp):.4f}",
+                        supplier,
+                    ],
+                )
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "WHOLESALE_CSV_EXPORT", "error": str(e)})
+
+    if verbose:
+        print("ALL preview kĂ©sz.")
+        print(
+            f"MASTER_CREATE ok={ok_create} | "
+            f"MASTER_UPDATE ok={ok_update} | "
+            f"ENRICH_UPDATE ok={ok_enrich} | "
+            f"DELETE_PREVIEW ok={ok_delete} | "
+            f"WHOLESALE ok={ok_wholesale} | "
+            f"errors={err_count}"
+        )
+        if args.write:
+            print("Files saved to:", DEBUG_DIR)
+
+
+if __name__ == "__main__":
+    main()
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\runner\__init__.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\shoprenter\batch.py
+=============================
+
+# tĂ¶meges feldolgozĂˇs logika
+from __future__ import annotations
+
+from typing import Iterable, Dict, Any, Callable, List, Tuple
+import time
+import json
+import os
+
+import requests
+from requests.exceptions import HTTPError
+
+
+def run_bulk_upsert(
+    *,
+    client,
+    products: Iterable[Dict[str, Any]],
+    build_payload: Callable[[Dict[str, Any]], Dict[str, Any]],
+    sku_map: Dict[str, str],
+    sleep_s: float = 0.3,
+    max_items: int | None = None,
+) -> dict:
+    """
+    TĂ¶meges UPsert (CREATE + UPDATE) feldolgozĂˇs egyenkĂ©nti API hĂ­vĂˇsokkal.
+
+    CĂ©l:
+        Egy iterĂˇlhatĂł termĂ©klistĂˇn vĂ©gigmenni, Ă©s minden termĂ©kre:
+        - ha a SKU mĂˇr lĂ©tezik a Shoprenterben (sku_map alapjĂˇn) -> UPDATE
+        - ha nem lĂ©tezik -> CREATE, majd a kapott id-t visszaĂ­rni a sku_map-be
+
+    FĹ‘ jellemzĹ‘k:
+        - soronkĂ©nti feldolgozĂˇs (nem batch)
+        - hibĂˇk logolĂˇsa JSONL formĂˇtumba: data/debug/bulk_result.jsonl
+        - hibĂˇs payloadok kĂĽlĂ¶n mentĂ©se: data/debug/failed_payloads/<sku>.json
+        - rate limit (429) esetĂ©n extra vĂˇrakozĂˇs
+
+    ParamĂ©terek:
+        client:
+            Olyan kliens objektum, ami az alĂˇbbi metĂłdusokat biztosĂ­tja:
+                - update_product(product_id: str, payload: dict) -> None / response
+                - create_product(payload: dict) -> dict  (benne: {"id": "..."} )
+
+        products (Iterable[Dict[str, Any]]):
+            NormalizĂˇlt termĂ©kek iterĂˇlhatĂł gyĹ±jtemĂ©nye.
+            ElvĂˇrt, hogy minden termĂ©k tartalmazzon legalĂˇbb "sku" mezĹ‘t.
+
+        build_payload (Callable[[Dict[str, Any]], Dict[str, Any]]):
+            FĂĽggvĂ©ny, ami egy normalizĂˇlt termĂ©kbĹ‘l Shoprenter kompatibilis payloadot Ă©pĂ­t.
+            A visszatĂ©rĹ‘ dict-nek tartalmaznia kell a "sku" kulcsot.
+
+        sku_map (Dict[str, str]):
+            SKU -> Shoprenter productExtend id map.
+            Ez alapjĂˇn dĂ¶ntjĂĽk el, hogy UPDATE vagy CREATE tĂ¶rtĂ©njen.
+            CREATE utĂˇn a map frissĂĽl (sku -> Ăşj id).
+
+        sleep_s (float):
+            Alap vĂˇrakozĂˇs kĂ©t termĂ©k feldolgozĂˇsa kĂ¶zĂ¶tt (throttling).
+            AlapĂ©rtelmezett: 0.3 sec.
+
+        max_items (int | None):
+            Ha meg van adva, maximum ennyi termĂ©ket dolgoz fel (debug / teszt cĂ©lra).
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        dict:
+            Ă–sszegzĂ©s:
+                {
+                  "created": int,
+                  "updated": int,
+                  "failed": int,
+                  "total": int
+                }
+
+    HibakezelĂ©s:
+        - HTTPError: logoljuk a status kĂłdot Ă©s a response body elsĹ‘ 2000 karakterĂ©t,
+          payload mentĂ©se sku alapjĂˇn.
+        - 429 esetĂ©n nagyobb sleep.
+        - ĂˇltalĂˇnos Exception: log + sleep.
+
+    MegjegyzĂ©s:
+        Ez a megoldĂˇs egyszerĹ± Ă©s robusztus, de lassabb, mint a batch endpoint hasznĂˇlata.
+        Nagy mennyisĂ©gnĂ©l ajĂˇnlott ĂˇttĂ©rni a /batch alapĂş mĂłdszerre (lĂˇsd lentebb).
+    """
+    # Debug kĂ¶nyvtĂˇr lĂ©trehozĂˇsa (logok/payload dump)
+    os.makedirs("data/debug", exist_ok=True)
+    log_path = "data/debug/bulk_result.jsonl"
+
+    created = updated = failed = 0
+    i = 0
+
+    # JSONL log (minden sor egy JSON objektum)
+    with open(log_path, "a", encoding="utf-8") as log:
+        for p in products:
+            i += 1
+            if max_items is not None and i > max_items:
+                break
+
+            sku = str(p.get("sku", "")).strip()
+
+            try:
+                # Payload Ă©pĂ­tĂ©s beszĂˇllĂ­tĂłi termĂ©kbĹ‘l
+                payload = build_payload(p)
+                action = None
+
+                # DĂ¶ntĂ©s: update vagy create
+                existing_id = sku_map.get(payload["sku"])
+                if existing_id:
+                    # UPDATE
+                    client.update_product(existing_id, payload)
+                    action = "updated"
+                    updated += 1
+                else:
+                    # CREATE
+                    resp = client.create_product(payload)
+                    sku_map[payload["sku"]] = resp.get("id")
+                    action = "created"
+                    created += 1
+
+                print(f"{i} {sku} -> {action}")
+                log.write(json.dumps({"sku": sku, "action": action}, ensure_ascii=False) + "\n")
+
+            except HTTPError as e:
+                # HTTP szintĹ± hiba (4xx/5xx)
+                failed += 1
+                status = getattr(e.response, "status_code", None)
+                body = getattr(e.response, "text", "")[:2000]
+
+                print(f"{i} {sku} -> FAILED ({status})")
+
+                # HibĂˇs payload mentĂ©se kĂ©sĹ‘bbi elemzĂ©shez
+                try:
+                    os.makedirs("data/debug/failed_payloads", exist_ok=True)
+                    with open(f"data/debug/failed_payloads/{sku}.json", "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    # MentĂ©si hiba ne ĂˇllĂ­tsa meg a futĂˇst
+                    pass
+
+                # JSONL log sor
+                log.write(
+                    json.dumps(
+                        {"sku": sku, "action": "failed", "status": status, "body": body},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
+                # Rate limit esetĂ©n agresszĂ­vebb backoff
+                if status == 429:
+                    time.sleep(max(2.0, sleep_s * 5))
+                else:
+                    time.sleep(sleep_s)
+
+            except Exception as e:
+                # EgyĂ©b futĂˇsidejĹ± hiba
+                failed += 1
+                print(f"{i} {sku} -> FAILED (exception): {e}")
+                log.write(json.dumps({"sku": sku, "action": "failed", "error": str(e)}, ensure_ascii=False) + "\n")
+                time.sleep(sleep_s)
+
+            # ĂltalĂˇnos throttling kĂ©t termĂ©k kĂ¶zĂ¶tt
+            time.sleep(sleep_s)
+
+    return {"created": created, "updated": updated, "failed": failed, "total": i}
+
+
+def chunked(lst: List[Any], n: int) -> Iterable[List[Any]]:
+    """
+    Lista feldarabolĂˇsa n mĂ©retĹ± darabokra (chunkokra).
+
+    ParamĂ©terek:
+        lst (List[Any]): FeldarabolandĂł lista.
+        n (int): Chunk mĂ©ret.
+
+    Yields:
+        List[Any]: A kĂ¶vetkezĹ‘ chunk (max n elem).
+    """
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+def post_batch(session: requests.Session, base_url: str, reqs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Shoprenter /batch endpoint meghĂ­vĂˇsa.
+
+    A Shoprenter batch formĂˇtum:
+        {
+          "data": {
+            "requests": [ {method, uri, data}, ... ]
+          }
+        }
+
+    ParamĂ©terek:
+        session (requests.Session): Autholt session a Shoprenter API-hoz.
+        base_url (str): API alap URL (pl. https://.../api).
+        reqs (List[Dict[str, Any]]): Batch request elemek listĂˇja.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Dict[str, Any]: A /batch vĂˇlasza (JSON).
+
+    KivĂ©tel:
+        requests.HTTPError: ha a HTTP stĂˇtusz nem 2xx.
+    """
+    payload = {"data": {"requests": reqs}}
+    r = session.post(f"{base_url.rstrip('/')}/batch", json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+def build_batch_requests_for_products(
+    *,
+    base_url: str,
+    sku_map: Dict[str, str],
+    payloads: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Batch request lista Ă©pĂ­tĂ©se termĂ©k payloadokbĂłl (UPsert logika).
+
+    SzabĂˇly:
+        - ha SKU benne van a sku_map-ben -> PUT /productExtend/{id}
+        - ha nincs -> POST /productExtend
+
+    Fontos:
+        Itt a PUT/POST requestek "data" mezĹ‘jĂ©be jelenleg a *teljes payload* kerĂĽl.
+        Sok esetben Ă©rdemes PUT esetĂ©n csak update mezĹ‘ket kĂĽldeni
+        (pl. build_update_payload_from_full), hogy elkerĂĽld a nem kĂ­vĂˇnt felĂĽlĂ­rĂˇsokat.
+
+    ParamĂ©terek:
+        base_url (str): Shoprenter API base URL.
+        sku_map (Dict[str, str]): SKU -> productExtend id map.
+        payloads (List[Dict[str, Any]]): TermĂ©k payloadok (mind tartalmazza a "sku"-t).
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        List[Dict[str, Any]]: /batch-be kĂĽldhetĹ‘ request elemek listĂˇja.
+    """
+    reqs: List[Dict[str, Any]] = []
+
+    base = base_url.rstrip("/")
+
+    for payload in payloads:
+        sku = payload["sku"].strip()
+        existing_id = sku_map.get(sku)
+
+        if existing_id:
+            reqs.append(
+                {
+                    "method": "PUT",
+                    "uri": f"{base}/productExtend/{existing_id}",
+                    "data": payload,
+                }
+            )
+        else:
+            reqs.append(
+                {
+                    "method": "POST",
+                    "uri": f"{base}/productExtend",
+                    "data": payload,
+                }
+            )
+
+    return reqs
+
+
+def parse_batch_results(batch_response: Dict[str, Any]) -> List[Tuple[int, str]]:
+    """
+    EgyszerĹ± batch eredmĂ©ny parser.
+
+    Kimenet:
+        List[Tuple[int, str]]: [(statusCode, uri), ...]
+
+    ElvĂˇrt input struktĂşra (gyakoribb Shoprenter vĂˇlasz):
+        {
+          "requests": {
+            "request": [
+              {
+                "uri": "...",
+                "response": {
+                  "header": {"statusCode": 200},
+                  ...
+                }
+              }
+            ]
+          }
+        }
+
+    ParamĂ©ter:
+        batch_response (Dict[str, Any]): /batch vĂˇlasz JSON.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        List[Tuple[int, str]]: stĂˇtuszkĂłd + uri pĂˇrok.
+
+    MegjegyzĂ©s:
+        Ez a parser csak egy konkrĂ©t struktĂşrĂˇt kezel.
+        Ha tĂ¶bbfĂ©le vĂˇlaszformĂˇtummal talĂˇlkozol, Ă©rdemes a korĂˇbbi
+        "parse_batch_response" robusztusabb vĂˇltozatot hasznĂˇlni.
+    """
+    out: List[Tuple[int, str]] = []
+    requests_block = batch_response.get("requests", {}).get("request", []) or []
+    for item in requests_block:
+        uri = item.get("uri", "")
+        status = int(item.get("response", {}).get("header", {}).get("statusCode", 0) or 0)
+        out.append((status, uri))
+    return out
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\shoprenter\client.py
+=============================
+
+from __future__ import annotations
+
+"""
+shoprenter.client
+=================
+
+Shoprenter API kliens (minimĂˇl, de bĹ‘vĂ­thetĹ‘) HTTP Basic Auth-al.
+
+Feladat
+-------
+Ez az osztĂˇly egysĂ©gesĂ­ti a Shoprenter API-hĂ­vĂˇsokat:
+- session + auth + alap header beĂˇllĂ­tĂˇsok
+- create / update mĹ±veletek a productExtend erĹ‘forrĂˇson
+- SKU alapjĂˇn id keresĂ©s (ha a Shoprenter API tĂˇmogatja a szĹ±rĂ©st)
+- lapozott lekĂ©rĂ©s a productExtend listĂˇbĂłl (sku_map Ă©pĂ­tĂ©shez)
+
+MegjegyzĂ©s
+----------
+A Shoprenter API pontos szĹ±rĂ©si szintaxisa projektenkĂ©nt eltĂ©rhet.
+A find_product_id_by_sku() implementĂˇciĂł ezĂ©rt "best effort" jellegĹ±:
+- ha a /products endpoint nem tĂˇmogatja a sku paramot Ă©s 400-at ad,
+  akkor None-t ad vissza.
+"""
+
+import requests
+from requests.auth import HTTPBasicAuth
+from typing import Dict, Any, Optional
+
+
+class ShoprenterClient:
+    """
+    EgyszerĹ± Shoprenter API kliens.
+
+    Konstruktor:
+        ShoprenterClient(base_url, user, password)
+
+    BelsĹ‘ mĹ±kĂ¶dĂ©s:
+        - requests.Session-t hasznĂˇl ĂşjrahasznosĂ­thatĂł kapcsolatokhoz
+        - HTTP Basic Auth-tal autentikĂˇl
+        - JSON request/response header-eket ĂˇllĂ­t be
+
+    AttribĂştumok:
+        base_url (str):
+            A Shoprenter API base URL, pl. "https://.../api".
+            A vĂ©gĂ©rĹ‘l a "/" le van vĂˇgva.
+
+        session (requests.Session):
+            Az auth-olt session.
+
+        timeout (int):
+            Alap timeout mĂˇsodpercben (jelenleg 30).
+    """
+
+    def __init__(self, base_url: str, user: str, password: str):
+        # Base URL normalizĂˇlĂˇsa: ne legyen a vĂ©gĂ©n "/"
+        self.base_url = base_url.rstrip("/")
+
+        # Session: connection pooling + kĂ¶zĂ¶s auth/header
+        self.session = requests.Session()
+        self.session.auth = HTTPBasicAuth(user, password)
+
+        # Alap header-ek JSON API-hoz
+        self.session.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+        )
+
+        # Default timeout (hasznĂˇlva a get_product_extend_page-ben)
+        self.timeout = 30
+
+    def create_product(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Ăšj termĂ©k lĂ©trehozĂˇsa (productExtend).
+
+        ParamĂ©ter:
+            payload (Dict[str, Any]):
+                Shoprenter API kompatibilis create payload.
+
+        VisszatĂ©rĂ©si Ă©rtĂ©k:
+            Dict[str, Any]:
+                A Shoprenter API JSON vĂˇlasza (jellemzĹ‘en tartalmaz "id"-t).
+
+        KivĂ©tel:
+            requests.HTTPError:
+                ha a vĂˇlasz nem 2xx.
+        """
+        r = self.session.post(f"{self.base_url}/productExtend", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def find_product_id_by_sku(self, sku: str) -> Optional[str]:
+        """
+        TermĂ©k azonosĂ­tĂł (id) keresĂ©se SKU alapjĂˇn.
+
+        FIGYELEM:
+            A Shoprenter API szĹ±rĂ©si paramĂ©terei eltĂ©rhetnek.
+            Itt egy gyakori mintĂˇt hasznĂˇlunk: GET /products?sku=...&limit=1&full=0
+
+        ParamĂ©ter:
+            sku (str): Keresett SKU.
+
+        VisszatĂ©rĂ©si Ă©rtĂ©k:
+            Optional[str]:
+                - product id (string), ha talĂˇlat van
+                - None, ha nincs talĂˇlat vagy a filter nem tĂˇmogatott
+
+        MĹ±kĂ¶dĂ©s:
+            - /products endpoint meghĂ­vĂˇsa
+            - ha 400: feltĂ©telezzĂĽk, hogy a filter szintaxis nem okĂ© -> None
+            - vĂˇlaszban:
+                - items[0].href -> id kinyerĂ©se az URL vĂ©gĂ©bĹ‘l
+                - vagy items[0].id
+
+        KivĂ©tel:
+            requests.HTTPError:
+                egyĂ©b (nem 400) hibakĂłd esetĂ©n.
+        """
+        # A Shoprenter API ĂˇltalĂˇban tĂˇmogat szĹ±rĂ©st query parammal (sku=...)
+        r = self.session.get(
+            f"{self.base_url}/products",
+            params={"limit": 1, "sku": sku, "full": 0},
+        )
+
+        if r.status_code == 400:
+            # Ha nĂˇlatok mĂˇs filter szintaxis van, ezt kĂ©sĹ‘bb finomĂ­tjuk.
+            return None
+
+        r.raise_for_status()
+
+        data = r.json()
+        items = data.get("items", [])
+        if not items:
+            return None
+
+        # item gyakran csak href-et ad, pl: ".../products/123"
+        href = items[0].get("href")
+        if href:
+            return href.rstrip("/").split("/")[-1]
+
+        # vagy id mezĹ‘
+        return items[0].get("id")
+
+    def update_product(self, product_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        TermĂ©k frissĂ­tĂ©se (productExtend/{id}) PUT-tal.
+
+        ParamĂ©terek:
+            product_id (str):
+                A frissĂ­tendĹ‘ productExtend azonosĂ­tĂłja.
+
+            payload (Dict[str, Any]):
+                Update payload.
+                MegjegyzĂ©s: Ă©rdemes itt "szĹ±rt" update payloadot hasznĂˇlni,
+                hogy ne Ă­rj felĂĽl nem kĂ­vĂˇnt mezĹ‘ket.
+
+        VisszatĂ©rĂ©si Ă©rtĂ©k:
+            Dict[str, Any]:
+                Shoprenter API vĂˇlasz JSON-ja.
+
+        KivĂ©tel:
+            requests.HTTPError:
+                ha a vĂˇlasz nem 2xx.
+        """
+        r = self.session.put(f"{self.base_url}/productExtend/{product_id}", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def get_product_extend_page(self, *, page: int, limit: int = 200, full: bool = True) -> dict:
+        """
+        Lapozott lekĂ©rĂ©s a productExtend listĂˇbĂłl (sku_map Ă©pĂ­tĂ©shez / importhoz).
+
+        ParamĂ©terek:
+            page (int):
+                OldalszĂˇm (Shoprenter API lapozĂˇs szerint).
+                (Hogy 0- vagy 1-indexelt-e, az API implementĂˇciĂłtĂłl fĂĽgg.)
+
+            limit (int):
+                OldalmĂ©ret (alap: 200).
+
+            full (bool):
+                Ha True, a "full=1" paramĂ©terrel rĂ©szletesebb objektumokat kĂ©r.
+                Ha False, "full=0" (gyorsabb, kisebb payload).
+
+        VisszatĂ©rĂ©si Ă©rtĂ©k:
+            dict:
+                A Shoprenter API vĂˇlasza (ĂˇltalĂˇban items + paging/meta).
+
+        KivĂ©tel:
+            requests.HTTPError:
+                ha a vĂˇlasz nem 2xx.
+
+        MegjegyzĂ©s:
+            A timeout itt self.timeout Ă©rtĂ©ket hasznĂˇlja.
+        """
+        r = self.session.get(
+            f"{self.base_url}/productExtend",
+            params={"page": page, "limit": limit, "full": 1 if full else 0},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\shoprenter\lookups.py
+=============================
+
+from __future__ import annotations
+
+"""
+shoprenter.lookups
+==================
+
+SegĂ©dfĂĽggvĂ©nyek a Shoprenter API-bĂłl tĂ¶rtĂ©nĹ‘ adatok lekĂ©rĂ©sĂ©hez.
+
+Ez a modul jelenleg egy fontos lookup funkciĂłt tartalmaz:
+
+    build_product_sku_map()
+
+Feladat
+-------
+A Shoprenterben mĂˇr lĂ©tezĹ‘ termĂ©kekbĹ‘l felĂ©pĂ­t egy:
+
+    SKU -> productExtend id
+
+tĂ©rkĂ©pet (dict), amely elengedhetetlen az UPsert (CREATE + UPDATE) logikĂˇhoz.
+
+MiĂ©rt fontos?
+-------------
+UPsert sorĂˇn el kell dĂ¶nteni:
+- ha egy SKU mĂˇr lĂ©tezik a Shoprenterben -> UPDATE
+- ha nem lĂ©tezik -> CREATE
+
+Ehhez gyors lookup kell, nem minden SKU-ra kĂĽlĂ¶n API hĂ­vĂˇs.
+Ez a fĂĽggvĂ©ny lapozva beolvassa az Ă¶sszes productExtend elemet,
+Ă©s memĂłriĂˇban felĂ©pĂ­ti a teljes SKU map-et.
+"""
+
+from typing import Dict
+import time
+
+
+def build_product_sku_map(
+    client,
+    *,
+    limit: int = 200,
+    sleep_s: float = 0.2,
+    max_pages: int = 2000,   # vĂ©szfĂ©k
+) -> Dict[str, str]:
+    """
+    FelĂ©pĂ­ti a Shoprenter SKU -> productExtend id tĂ©rkĂ©pet.
+
+    MĹ±kĂ¶dĂ©s:
+        - lapozva meghĂ­vja a client.get_product_extend_page(...) metĂłdust
+        - minden oldalon:
+            - kiolvassa az items listĂˇt
+            - minden elemnĂ©l:
+                sku = item["sku"]
+                id  = item["id"]
+            - ha mindkettĹ‘ lĂ©tezik -> eltĂˇrolja a dict-ben
+        - addig megy, amĂ­g:
+            - el nem Ă©ri a pageCount-ot, vagy
+            - el nem Ă©ri a max_pages limitet (vĂ©szfĂ©k)
+
+    ParamĂ©terek:
+        client:
+            ShoprenterClient pĂ©ldĂˇny, amely biztosĂ­tja:
+                get_product_extend_page(page, limit, full)
+
+        limit (int):
+            OldalmĂ©ret (hĂˇny termĂ©ket kĂ©r le egyszerre).
+            Nagyobb Ă©rtĂ©k = kevesebb kĂ¶r, de nagyobb payload.
+
+        sleep_s (float):
+            VĂˇrakozĂˇs kĂ©t oldal lekĂ©rĂ©se kĂ¶zĂ¶tt (rate limit vĂ©delem).
+
+        max_pages (int):
+            BiztonsĂˇgi vĂ©szfĂ©k.
+            Ha ennyi oldal utĂˇn mĂ©g nem Ă©rtĂĽnk a vĂ©gĂ©re,
+            RuntimeError dobĂłdik (valĂłszĂ­nĹ±leg pageCount problĂ©ma).
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        Dict[str, str]:
+            SKU -> productExtend id map.
+
+    PĂ©lda:
+        {
+          "ABC123": "4567",
+          "XYZ999": "8910"
+        }
+
+    HibakezelĂ©s:
+        - Ha page >= max_pages -> RuntimeError
+        - A get_product_extend_page belĂĽl HTTPError dobhat, ha API hiba van.
+
+    TeljesĂ­tmĂ©ny:
+        - O(N) ahol N a shopban lĂ©vĹ‘ termĂ©kek szĂˇma.
+        - 10-20k termĂ©k esetĂ©n Ă©rdemes a limit-et nĂ¶velni (pl. 500-1000),
+          ha az API engedi.
+    """
+    page = 0
+    out: Dict[str, str] = {}
+
+    while True:
+        t0 = time.time()
+
+        # Oldal lekĂ©rĂ©se a Shoprenter API-bĂłl
+        data = client.get_product_extend_page(
+            page=page,
+            limit=limit,
+            full=True,   # full=True: biztosan legyen sku Ă©s id
+        )
+
+        # API Ăˇltal visszaadott teljes oldalszĂˇm
+        page_count = int(data.get("pageCount") or 0)
+
+        # Az adott oldalon lĂ©vĹ‘ elemek
+        items = data.get("items", []) or []
+
+        # SKU -> id kinyerĂ©se
+        for it in items:
+            sku = (it.get("sku") or "").strip()
+            pid = it.get("id")
+            if sku and pid:
+                out[sku] = pid
+
+        dt = time.time() - t0
+
+        print(
+            f"[SKU_MAP] "
+            f"page={page+1}/{page_count} "
+            f"items={len(items)} "
+            f"map_size={len(out)} "
+            f"dt={dt:.2f}s"
+        )
+
+        page += 1
+
+        # -----------------------------
+        # STOP feltĂ©telek
+        # -----------------------------
+
+        # Ha az API jelzi a teljes oldalszĂˇmot, Ă©s elĂ©rtĂĽk a vĂ©gĂ©t
+        if page_count and page >= page_count:
+            break
+
+        # VĂ©szfĂ©k: tĂşl sok oldal (valĂłszĂ­nĹ±leg pageCount/oldalazĂˇsi hiba)
+        if page >= max_pages:
+            raise RuntimeError(
+                f"VĂ©szfĂ©k: max_pages elĂ©rve ({max_pages}). "
+                "ValĂłszĂ­nĹ± pageCount/oldalazĂˇs gond van."
+            )
+
+        # Rate limit vĂ©delem
+        time.sleep(sleep_s)
+
+    return out
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\shoprenter\payloads_natura.py
+=============================
+
+from __future__ import annotations
+
+from typing import Any, Dict, Mapping, Optional, Set, Literal, Callable, TypedDict
+from src.utils.images import build_shop_image_path, image_alt_from_model
+
+DEFAULT_CATEGORY_ID = "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4"
+WHOLESALE_GROUP_NAME_DEFAULT = "NAGYKER"
+
+
+PayloadMode = Literal[
+    "MASTER_CREATE",
+    "MASTER_UPDATE",
+    "ENRICH_UPDATE",
+    "WHOLESALE_PRICE_UPDATE",
+]
+
+
+# -----------------------------
+# Field sets
+# -----------------------------
+class PayloadFieldSets(TypedDict):
+    MASTER_CREATE: Set[str]
+    MASTER_UPDATE: Set[str]
+    ENRICH_UPDATE: Set[str]
+    WHOLESALE_PRICE_UPDATE: Set[str]
+
+
+PAYLOAD_FIELDS: PayloadFieldSets = {
+    "MASTER_CREATE": {
+        "sku",
+        "modelNumber",
+        "gtin",
+        "price",
+        "status",
+        "stock1",
+        "productDescriptions",
+        "productCategoryRelations",
+        "_post_actions",
+        "mainPicture",
+        "imageAlt",
+    },
+    "MASTER_UPDATE": {
+        "sku",
+        "modelNumber",
+        "gtin",
+        "price",
+        "productDescriptions",
+        "_post_actions",
+    },
+    "ENRICH_UPDATE": {
+        "sku",
+        "productDescriptions",
+        "mainPicture",
+        "imageAlt",
+    },
+    "WHOLESALE_PRICE_UPDATE": {
+        "sku",
+        "modelNumber",
+        "price",
+        "_post_actions",
+    },
+}
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def filter_payload(data: Dict[str, Any], fields: Set[str]) -> Dict[str, Any]:
+    return {k: v for k, v in data.items() if k in fields and v is not None}
+
+
+def _fmt_price(x: float) -> str:
+    return f"{float(x):.4f}"
+
+
+def _require_str(p: Dict[str, Any], key: str, *, ctx: str) -> str:
+    v = str(p.get(key, "")).strip()
+    if not v:
+        raise ValueError(f"Missing {key} ({ctx})")
+    return v
+
+
+def _pick_name_hu(p: Dict[str, Any]) -> str:
+    for k in ("name_hu", "product_name_hu", "name", "title_hu"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+    return _require_str(p, "sku", ctx="name_fallback")
+
+
+def _pick_desc_hu(p: Dict[str, Any]) -> str:
+    for k in ("description_hu", "desc_hu", "description"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
+    urls = p.get("image_urls")
+    if isinstance(urls, list) and urls:
+        u0 = str(urls[0] or "").strip()
+        return u0 or None
+
+    for k in ("main_image", "image_url", "image", "mainPicture"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def _resolve_category_id(
+    p: Dict[str, Any],
+    *,
+    category_id: Optional[str],
+    category_map: Optional[Mapping[str, str]],
+) -> str:
+    if category_id:
+        return category_id
+
+    if category_map:
+        for k in ("category", "category_name", "group1", "CSOPORT1"):
+            name = (p.get(k) or "").strip()
+            if name and name in category_map:
+                return category_map[name]
+
+    for k in ("category_id", "shoprenter_category_id"):
+        v = (p.get(k) or "").strip()
+        if v:
+            return v
+
+    return DEFAULT_CATEGORY_ID
+
+
+def _wholesale_post_actions(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    wholesale = p.get("wholesale_price")
+    if wholesale is None:
+        return None
+
+    return {
+        "customer_group_prices": [
+            {
+                "customer_group_name": WHOLESALE_GROUP_NAME_DEFAULT,
+                "price": _fmt_price(float(wholesale)),
+            }
+        ]
+    }
+
+
+# -----------------------------
+# Builder-ek
+# -----------------------------
+def build_master_create_payload(
+    p: Dict[str, Any],
+    *,
+    language_id: str,
+    status_value: int = 0,
+    stock1: int = 0,
+    category_id: Optional[str] = None,
+    category_map: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="master_create")
+
+    gross = p.get("gross_price")
+    if gross is None:
+        raise ValueError(f"Missing gross_price (master_create sku={sku})")
+
+    model = (p.get("model") or "").strip() or sku
+    gtin = (p.get("gtin") or p.get("ean") or "").strip() or None
+
+    name_hu = _pick_name_hu(p)
+    desc_hu = _pick_desc_hu(p)
+    cat_id = _resolve_category_id(p, category_id=category_id, category_map=category_map)
+
+    # 1) Natura / enrich kĂ©p (ha van)
+    main_img = _pick_main_image(p)
+
+    # 2) Fallback: product/{CSOPORT1}/{model}.jpg
+    if not main_img:
+        csoport1 = (p.get("csoport1_name") or "").strip()
+        model = (p.get("model") or "").strip() or sku
+
+        generated = build_shop_image_path(csoport1, model, slot=1, ext=".jpg")
+        if generated:
+            main_img = generated
+
+    pd: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        pd["description"] = desc_hu
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "modelNumber": model,
+        "gtin": gtin,
+        "price": _fmt_price(float(gross)),
+        "status": int(status_value),
+        "stock1": int(stock1),
+        "productDescriptions": [pd],
+        "productCategoryRelations": [{"category_id": cat_id}],
+        "mainPicture": main_img,
+        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
+        "_post_actions": _wholesale_post_actions(p),
+    }
+
+    return filter_payload(payload, PAYLOAD_FIELDS["MASTER_CREATE"])
+
+
+def build_master_update_payload(
+    p: Dict[str, Any],
+    *,
+    language_id: str,
+) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="master_update")
+
+    gross = p.get("gross_price")
+    if gross is None:
+        raise ValueError(f"Missing gross_price (master_update sku={sku})")
+
+    model = (p.get("model") or "").strip() or sku
+    gtin = (p.get("gtin") or p.get("ean") or "").strip() or None
+
+    name_hu = _pick_name_hu(p)
+    desc_hu = _pick_desc_hu(p)
+
+    pd: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        pd["description"] = desc_hu
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "modelNumber": model,
+        "gtin": gtin,
+        "price": _fmt_price(float(gross)),
+        "productDescriptions": [pd],
+        "_post_actions": _wholesale_post_actions(p),
+    }
+
+    return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
+
+
+def build_enrich_update_payload(
+    p: Dict[str, Any],
+    *,
+    language_id: str,
+) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="enrich_update")
+
+    name_hu = _pick_name_hu(p)
+    desc_hu = _pick_desc_hu(p)
+
+    # ENRICH_UPDATE: nĂˇlad mainPicture = TELJES URL
+    main_img = _pick_main_image(p)  # ez nĂˇlad image_urls[0]-t ad, ami mĂˇr teljes URL
+
+    model = (p.get("model") or "").strip() or sku
+
+    pd: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        pd["description"] = desc_hu
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "productDescriptions": [pd],
+        "mainPicture": main_img,
+        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
+    }
+
+    return filter_payload(payload, PAYLOAD_FIELDS["ENRICH_UPDATE"])
+
+
+def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
+    sku = _require_str(p, "sku", ctx="wholesale_price_update")
+
+    gross = p.get("gross_price")
+    if gross is None:
+        raise ValueError(f"Missing gross_price (wholesale_price_update sku={sku})")
+
+    model = (p.get("model") or "").strip() or sku
+
+    post_actions = _wholesale_post_actions(p)
+    if not post_actions:
+        raise ValueError(f"Missing wholesale_price (wholesale_price_update sku={sku})")
+
+    payload: Dict[str, Any] = {
+        "sku": sku,
+        "modelNumber": model,
+        "price": _fmt_price(float(gross)),
+        "_post_actions": post_actions,
+    }
+
+    return filter_payload(payload, PAYLOAD_FIELDS["WHOLESALE_PRICE_UPDATE"])
+
+
+# -----------------------------
+# Registry
+# -----------------------------
+_BUILDERS: Dict[PayloadMode, Callable[..., Dict[str, Any]]] = {
+    "MASTER_CREATE": build_master_create_payload,
+    "MASTER_UPDATE": build_master_update_payload,
+    "ENRICH_UPDATE": build_enrich_update_payload,
+    "WHOLESALE_PRICE_UPDATE": build_wholesale_price_update_payload,
+}
+
+
+def build_payload(mode: PayloadMode, p: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+    fn = _BUILDERS[mode]
+    data = fn(p, **kwargs)  # type: ignore[misc]
+    return filter_payload(data, PAYLOAD_FIELDS[mode])
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\shoprenter\sync.py
+=============================
+
+from __future__ import annotations
+
+"""
+shoprenter.upsert
+=================
+
+EgyszerĹ± segĂ©dfĂĽggvĂ©nyek egyetlen termĂ©k CREATE / UPDATE (UPsert) mĹ±veletĂ©hez.
+
+Feladat
+-------
+A SKU alapjĂˇn eldĂ¶nteni:
+- ha mĂˇr lĂ©tezik a Shoprenterben (sku_map szerint) -> UPDATE
+- ha nem lĂ©tezik -> CREATE
+
+A sku_map egy in-memory cache:
+    SKU -> productExtend id
+
+Ez lehetĹ‘vĂ© teszi, hogy:
+- ne kelljen minden SKU-ra kĂĽlĂ¶n lekĂ©rdezĂ©st indĂ­tani
+- ugyanazon futĂˇson belĂĽl elkerĂĽljĂĽk a duplikĂˇlt create-et
+
+MegjegyzĂ©s
+----------
+Nagy mennyisĂ©gĹ± termĂ©k esetĂ©n a batch alapĂş megoldĂˇs hatĂ©konyabb.
+Ez a modul egyedi (soronkĂ©nti) hĂ­vĂˇsokhoz ideĂˇlis.
+"""
+
+from typing import Dict, Any
+
+
+def upsert_product(client, sku_map: dict[str, str], payload: Dict[str, Any]) -> str:
+    """
+    Egyetlen termĂ©k UPsert mĹ±velete SKU alapjĂˇn.
+
+    MĹ±kĂ¶dĂ©s:
+        1) SKU kiolvasĂˇsa a payload-bĂłl
+        2) Ha SKU benne van a sku_map-ben:
+              -> UPDATE (PUT /productExtend/{id})
+        3) Ha nincs:
+              -> CREATE (POST /productExtend)
+              -> visszakapott id eltĂˇrolĂˇsa a sku_map-ben
+
+    ParamĂ©terek:
+        client:
+            ShoprenterClient pĂ©ldĂˇny, amely biztosĂ­tja:
+                - update_product(id, payload)
+                - create_product(payload)
+
+        sku_map (dict[str, str]):
+            SKU -> productExtend id map.
+            A create utĂˇn frissĂĽl, hogy a tovĂˇbbi mĹ±veleteknĂ©l
+            ugyanazon futĂˇson belĂĽl mĂˇr UPDATE tĂ¶rtĂ©njen.
+
+        payload (Dict[str, Any]):
+            Shoprenter kompatibilis termĂ©k payload.
+            KĂ¶telezĹ‘ kulcs: "sku"
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        str:
+            "updated" vagy "created"
+
+    KivĂ©tel:
+        KeyError:
+            Ha a payload nem tartalmaz "sku" kulcsot.
+        requests.HTTPError:
+            Ha a Shoprenter API hibĂˇt ad.
+    """
+    sku = payload["sku"].strip()
+
+    existing_id = sku_map.get(sku)
+
+    if existing_id:
+        # MĂˇr lĂ©tezĹ‘ termĂ©k -> UPDATE
+        client.update_product(existing_id, payload)
+        return "updated"
+
+    # Ăšj termĂ©k -> CREATE
+    created = client.create_product(payload)
+
+    new_id = created.get("id")
+    if new_id:
+        # Map frissĂ­tĂ©se, hogy a futĂˇs tovĂˇbbi rĂ©szĂ©ben mĂˇr UPDATE tĂ¶rtĂ©njen
+        sku_map[sku] = new_id
+
+    return "created"
+
+
+def upsert_product_with_map(client, sku_map: dict[str, str], payload: dict) -> str:
+    """
+    AlternatĂ­v, minimalista UPsert implementĂˇciĂł.
+
+    FunkcionĂˇlisan nagyon hasonlĂł az upsert_product()-hez,
+    de kevĂ©sbĂ© defensĂ­v (pl. nincs strip, nincs id None ellenĹ‘rzĂ©s).
+
+    MĹ±kĂ¶dĂ©s:
+        - Ha SKU benne van a sku_map-ben -> UPDATE
+        - Ha nincs -> CREATE, majd az id eltĂˇrolĂˇsa a map-ben
+
+    ParamĂ©terek:
+        client:
+            ShoprenterClient pĂ©ldĂˇny.
+
+        sku_map (dict[str, str]):
+            SKU -> id tĂ©rkĂ©p (futĂˇs kĂ¶zbeni cache).
+
+        payload (dict):
+            Shoprenter payload, kĂ¶telezĹ‘ "sku" kulccsal.
+
+    VisszatĂ©rĂ©si Ă©rtĂ©k:
+        str:
+            "updated" vagy "created"
+
+    MegjegyzĂ©s:
+        Ez a verziĂł kevĂ©sbĂ© robusztus (pl. nem strip-el SKU-t),
+        ezĂ©rt production kĂ¶rnyezetben inkĂˇbb az upsert_product()
+        ajĂˇnlott.
+    """
+    sku = payload["sku"]
+    existing_id = sku_map.get(sku)
+
+    if existing_id:
+        client.update_product(existing_id, payload)
+        return "updated"
+
+    created = client.create_product(payload)
+
+    # FrissĂ­tjĂĽk a map-et, hogy ugyanabban a futĂˇsban
+    # se legyen duplikĂˇlt create ugyanarra a SKU-ra
+    sku_map[sku] = created.get("id")
+
+    return "created"
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\shoprenter\__init__.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\tests\sync_natura_test.py
+=============================
+
+"""
+sync_natura_test.py
+===================
+
+CĂ©l
+---
+Ez a teszt/preview script arra szolgĂˇl, hogy Natura termĂ©kadatokbĂłl
+Shoprenter kompatibilis *payloadokat* generĂˇljon Ă©s (opcionĂˇlisan) fĂˇjlba Ă­rja Ĺ‘ket
+debug / ellenĹ‘rzĂ©s cĂ©ljĂˇbĂłl.
+
+A script NEM szinkronizĂˇl Ă©lesben (nem hĂ­v API-t), csak payload preview-t kĂ©szĂ­t:
+- MASTER_CREATE: POST /productExtend (teljes create payload)
+- MASTER_UPDATE: PUT /productExtend/{id} (update payload â€“ itt placeholder ID-val)
+- WHOLESALE CSV export: ĂˇrfrissĂ­tĂ©shez CSV kimenet (Natura alapbĂłl, HaldepĂł felĂĽlĂ­rhat)
+
+OpcionĂˇlisan HaldepĂł (enricher) adatokkal is Ă¶sszefĂ©sĂĽli a Natura rekordokat:
+- match_key / master_keys alapjĂˇn enrichment merge
+- wholesale ĂˇraknĂˇl model alapjĂˇn felĂĽlĂ­rhatja a gross/wholesale mezĹ‘ket
+
+BeĂˇllĂ­tĂˇsok (.env)
+------------------
+A script a .env fĂˇjlbĂłl is tud dolgozni (python-dotenv).
+
+AjĂˇnlott vĂˇltozĂłk:
+- SHOPRENTER_API_URL
+    Pl.: https://your-shoprenter-domain/api
+    A payload "uri" mezĹ‘jĂ©hez kell (csak preview).
+
+- TEST_PRODUCT_SKU
+    Ha be van ĂˇllĂ­tva, akkor alapbĂłl erre az SKU-ra szĹ±r.
+    (FuttatĂˇsnĂˇl a --sku felĂĽlĂ­rja.)
+
+Kimenetek (ha --write)
+----------------------
+A fĂˇjlok ide kerĂĽlnek:
+    data/debug/payload/
+
+LĂ©trejĂ¶vĹ‘ fĂˇjlok:
+- master_create_all.jsonl
+    Natura -> Shoprenter POST /productExtend payloadok (JSONL formĂˇtumban)
+
+- master_update_all.jsonl
+    Natura -> Shoprenter PUT /productExtend/{id} payloadok (JSONL formĂˇtumban)
+    MegjegyzĂ©s: a script "PRODUCT_EXTEND_ID_HERE" placeholder-t tesz a uri-ba.
+
+- wholesale_price_update_all.csv
+    ; szeparĂˇlt CSV: sku;model;gross_price;wholesale_price;supplier
+    supplier mezĹ‘: "natura" vagy "haldepo" (ha HaldepĂł felĂĽlĂ­rta az Ăˇrakat)
+
+- errors.jsonl
+    BĂˇrmely stage (MASTER_CREATE / MASTER_UPDATE / WHOLESALE_CSV_EXPORT) hibĂˇja ide kerĂĽl.
+
+FuttatĂˇsi pĂ©ldĂˇk
+----------------
+1) Alap preview (csak konzol summary, nem Ă­r fĂˇjlt):
+    python -m src.tests.sync_natura_test
+
+2) Egy konkrĂ©t SKU tesztelĂ©se (nem Ă­r fĂˇjlt):
+    python -m src.tests.sync_natura_test --sku 12345
+
+3) ĂŤrĂˇs fĂˇjlba (JSONL + CSV + hibĂˇk):
+    python -m src.tests.sync_natura_test --write
+
+4) HaldepĂł enrichment bekapcsolĂˇsa is:
+    python -m src.tests.sync_natura_test --write --with-haldepo
+
+5) LimitĂˇlt elemszĂˇm (pl. elsĹ‘ 50 termĂ©k):
+    python -m src.tests.sync_natura_test --write --limit 50
+
+6) Csendes mĂłd (kevesebb print):
+    python -m src.tests.sync_natura_test --write --quiet
+
+MegjegyzĂ©sek
+------------
+- A script feltĂ©telezi, hogy az ingest/normalize rĂ©teg mĹ±kĂ¶dik:
+  - ingest_one_supplier_csv("natura"/"haldepo")
+  - normalize_rows("natura"/"haldepo", raw)
+- A HaldepĂł wholesale felĂĽlĂ­rĂˇs model alapjĂˇn tĂ¶rtĂ©nik:
+  - model = p_master["model"] vagy ha nincs, akkor sku
+  - haldepo index: modelNumber vagy model mezĹ‘bĹ‘l
+
+JĂ¶vĹ‘beli bĹ‘vĂ­tĂ©s
+----------------
+- ENRICH_UPDATE: ha lesz kĂĽlĂ¶n enrich update payload / endpoint, ide lehet betenni
+  Ă©s az out_enrich_update_all.jsonl fĂˇjl is hasznĂˇlhatĂł lesz.
+"""
+from __future__ import annotations
+
+import os
+import json
+import csv
+import argparse
+from pathlib import Path
+from typing import Dict, Any, List
+
+from dotenv import load_dotenv
+
+from src.ingest.suppliers_csv import ingest_one_supplier_csv
+import src.normalize.suppliers  # registry bootstrap
+from src.normalize import normalize_rows
+from src.utils.numbers import net_to_gross_rounded_5
+from src.shoprenter.payloads_natura import build_payload
+
+from src.merge.merge_products import (
+    build_master_keys,
+    index_enricher_by_key,
+    merge_master_with_enricher,
+)
+
+load_dotenv()
+
+LANGUAGE_ID = "bGFuZ3VhZ2UtbGFuZ3VhZ2UfaWQ9MQ=="
+DEBUG_DIR = Path("data/debug/payload")
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+TEST_PRODUCT_SKU = (os.getenv("TEST_PRODUCT_SKU") or "").strip()
+
+
+# -------------------------------------------------
+# LOADERS
+# -------------------------------------------------
+def load_natura_products(*, verbose: bool = True) -> List[Dict[str, Any]]:
+    raw = ingest_one_supplier_csv("natura")
+    products = normalize_rows("natura", raw)
+    if verbose:
+        print(f"NATURA: raw={len(raw)} normalized={len(products)}")
+    return products
+
+
+def load_haldepo_rows(*, verbose: bool = True) -> List[Dict[str, Any]]:
+    raw = ingest_one_supplier_csv("haldepo")
+    rows = normalize_rows("haldepo", raw)
+    if verbose:
+        print(f"HALDEPO: raw={len(raw)} normalized={len(rows)}")
+    return rows
+
+
+# -------------------------------------------------
+# JSONL helpers
+# -------------------------------------------------
+def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, indent=2))
+        f.write("\n\n")
+
+
+def reset_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
+# -------------------------------------------------
+# CSV helpers
+# -------------------------------------------------
+def init_csv(path: Path, headers: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(headers)
+
+
+def append_csv_row(path: Path, row: List[Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(row)
+
+
+# -------------------------------------------------
+# Index helpers
+# -------------------------------------------------
+def build_haldepo_index_by_model(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        model = (r.get("modelNumber") or r.get("model") or "").strip()
+        if model:
+            out[model] = r
+    return out
+
+
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Natura FULL payload preview")
+    parser.add_argument("--write", action="store_true", help="Write debug output files")
+    parser.add_argument("--sku", default=TEST_PRODUCT_SKU, help="Only process this SKU (or env TEST_PRODUCT_SKU)")
+    parser.add_argument("--limit", type=int, default=0, help="Limit number of processed products (0 = no limit)")
+    parser.add_argument("--with-haldepo", action="store_true", help="Merge HaldepĂł rows for enrichment/wholesale price")
+    parser.add_argument("--quiet", action="store_true", help="Less console output")
+    args = parser.parse_args()
+
+    verbose = not args.quiet
+
+    natura_products = load_natura_products(verbose=verbose)
+    base = (os.getenv("SHOPRENTER_API_URL", "") or "").rstrip("/")
+
+    # SKU szĹ±rĂ©s (ha meg van adva)
+    sku_filter = (args.sku or "").strip()
+    if sku_filter:
+        natura_products = [p for p in natura_products if str(p.get("sku", "")).strip() == sku_filter]
+        if not natura_products:
+            raise RuntimeError(f"Nincs ilyen SKU NaturĂˇban: {sku_filter}")
+
+    if args.limit and args.limit > 0:
+        natura_products = natura_products[: args.limit]
+
+    if verbose:
+        print(f"PROCESSING: {len(natura_products)} product(s)")
+
+    # ---------------------------------------------
+    # HaldepĂł elĹ‘kĂ©szĂ­tĂ©s
+    # ---------------------------------------------
+    p_enrich_list = natura_products
+    haldepo_by_model: Dict[str, Dict[str, Any]] = {}
+
+    if args.with_haldepo:
+        haldepo_rows = load_haldepo_rows(verbose=verbose)
+        haldepo_by_model = build_haldepo_index_by_model(haldepo_rows)
+
+        # enrich merge (match_key alapĂş index)
+        master_keys = build_master_keys(natura_products)
+        haldepo_by_key = index_enricher_by_key(haldepo_rows, master_keys)
+        p_enrich_list = merge_master_with_enricher(natura_products, haldepo_by_key)
+
+    # ---------------------------------------------
+    # Output fĂˇjlok
+    # ---------------------------------------------
+    out_master_create = DEBUG_DIR / "master_create_all.jsonl"
+    out_master_update = DEBUG_DIR / "master_update_all.jsonl"
+    out_enrich_update = DEBUG_DIR / "enrich_update_all.jsonl"  # (jelenleg nem Ă­runk bele, csak elĹ‘kĂ©szĂ­tve)
+    out_wholesale = DEBUG_DIR / "wholesale_price_update_all.csv"
+    out_errors = DEBUG_DIR / "errors.jsonl"
+
+    if args.write:
+        reset_file(out_master_create)
+        reset_file(out_master_update)
+        reset_file(out_enrich_update)
+        reset_file(out_errors)
+        init_csv(out_wholesale, ["sku", "model", "gross_price", "wholesale_price"])
+
+    ok_create = ok_update = ok_enrich = ok_wholesale = 0
+    err_count = 0
+
+    # ---------------------------------------------
+    # FĹ LOOP
+    # ---------------------------------------------
+    for p_master, p_enrich in zip(natura_products, p_enrich_list):
+        sku = str(p_master.get("sku", "")).strip()
+        model = (p_master.get("model") or "").strip() or sku
+
+        # MASTER CREATE
+        try:
+            payload = {
+                "sku": sku,
+                "method": "POST",
+                "uri": f"{base}/productExtend",
+                "data": build_payload(
+                    "MASTER_CREATE",
+                    p_master,
+                    language_id=LANGUAGE_ID,
+                    status_value=0,
+                    stock1=0,
+                ),
+            }
+            ok_create += 1
+            if args.write:
+                append_jsonl(out_master_create, payload)
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_CREATE", "error": str(e)})
+
+        # MASTER UPDATE
+        try:
+            payload = {
+                "sku": sku,
+                "method": "PUT",
+                "uri": f"{base}/productExtend/PRODUCT_EXTEND_ID_HERE",
+                "data": build_payload(
+                    "MASTER_UPDATE",
+                    p_master,
+                    language_id=LANGUAGE_ID,
+                ),
+            }
+            ok_update += 1
+            if args.write:
+                append_jsonl(out_master_update, payload)
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_UPDATE", "error": str(e)})
+
+        # ENRICH UPDATE (opcionĂˇlis: ha kĂ©sĹ‘bb lesz kĂĽlĂ¶n endpoint / payload)
+        # Itt most csak a szĂˇmlĂˇlĂł marad, hogy a summary ne legyen fĂ©lrevezetĹ‘.
+        # Ha kĂ©sĹ‘bb megĂ­rod, ide jĂ¶het.
+        # ok_enrich += 1
+
+        # WHOLESALE (CSV export MySQL frissĂ­tĂ©shez)
+        try:
+            source_for_wholesale = dict(p_master)
+            price_source = "natura"
+
+            if args.with_haldepo:
+                h = haldepo_by_model.get(model)
+                if h:
+                    price_source = "haldepo"
+                    if h.get("gross_price") is not None:
+                        source_for_wholesale["gross_price"] = h["gross_price"]
+                    if h.get("wholesale_price") is not None:
+                        source_for_wholesale["wholesale_price"] = h["wholesale_price"]
+
+            gp = source_for_wholesale.get("gross_price")
+            wp = source_for_wholesale.get("wholesale_price")
+
+            if price_source == "haldepo":
+                if wp is not None:
+                    wp = net_to_gross_rounded_5(wp)
+
+            ok_wholesale += 1
+            if args.write:
+                append_csv_row(
+                    out_wholesale,
+                    [
+                        sku,
+                        model,
+                        "" if gp is None else f"{float(gp):.4f}",
+                        "" if wp is None else f"{float(wp):.4f}",
+                    ],
+                )
+        except Exception as e:
+            err_count += 1
+            if args.write:
+                append_jsonl(out_errors, {"sku": sku, "stage": "WHOLESALE_CSV_EXPORT", "error": str(e)})
+
+    if verbose:
+        print("ALL preview kĂ©sz.")
+        print(
+            f"MASTER_CREATE ok={ok_create} | "
+            f"MASTER_UPDATE ok={ok_update} | "
+            f"ENRICH_UPDATE ok={ok_enrich} | "
+            f"WHOLESALE ok={ok_wholesale} | "
+            f"errors={err_count}"
+        )
+        if args.write:
+            print("Files saved to:", DEBUG_DIR)
+
+
+if __name__ == "__main__":
+    main()
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\tests\test_categories.py
+=============================
+
+import os
+import csv
+import requests
+from dotenv import load_dotenv
+from requests.auth import HTTPBasicAuth
+
+load_dotenv()
+
+BASE = os.getenv("SHOPRENTER_API_URL").rstrip("/")
+AUTH = HTTPBasicAuth(
+    os.getenv("SHOPRENTER_API_USER"),
+    os.getenv("SHOPRENTER_API_PASS")
+)
+
+session = requests.Session()
+session.auth = AUTH
+session.headers.update({"Accept": "application/json"})
+
+# mappa lĂ©trehozĂˇs ha nem lĂ©tezik
+os.makedirs("data/debug", exist_ok=True)
+
+output_file = "data/debug/categories.csv"
+
+with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+    writer = csv.writer(f, delimiter=";")
+    writer.writerow(["name", "id", "innerId", "parentInnerId"])
+
+    page = 0
+    limit = 100
+
+    while True:
+        r = session.get(
+            f"{BASE}/categoryExtend",
+            params={"full": 1, "page": page, "limit": limit},
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        for item in data.get("items", []):
+            descs = item.get("categoryDescriptions") or []
+            name = descs[0].get("name") if descs else ""
+
+            parent = item.get("parentCategory")
+            parent_inner = None
+            if isinstance(parent, dict):
+                parent_inner = parent.get("innerId")
+
+            writer.writerow([
+                name,
+                item.get("id"),
+                item.get("innerId"),
+                parent_inner
+            ])
+
+        page += 1
+        if page >= data.get("pageCount", 0):
+            break
+
+print("Mentve:", output_file)
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\tests\__init__.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\export_debug.py
+=============================
+
+from __future__ import annotations
+
+import json
+import csv
+from pathlib import Path
+from typing import Any
+
+
+# -------------------------------------------------
+# JSONL
+# -------------------------------------------------
+
+def reset_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
+def append_jsonl(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, indent=2))
+        f.write("\n\n")
+
+
+# -------------------------------------------------
+# CSV
+# -------------------------------------------------
+
+def init_csv(path: Path, headers: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(headers)
+
+
+def append_csv_row(path: Path, row: list[Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(row)
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\files.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\hash.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\images.py
+=============================
+
+from __future__ import annotations
+
+import re
+import unicodedata
+
+
+def norm_text(s: str) -> str:
+    """Alap normalizĂˇlĂˇs: whitespace trim + belsĹ‘ space-ek Ă¶sszevonĂˇsa."""
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def clean_sku(value: str) -> str:
+    """
+    SKU / model fĂˇjlnĂ©vhez:
+    - trim
+    - space -> -
+    - csak biztonsĂˇgos karakterek: A-Z a-z 0-9 _ -
+    """
+    s = norm_text(value)
+    if not s:
+        return ""
+    s = s.replace(" ", "-")
+    s = re.sub(r"[^A-Za-z0-9_\-]", "", s)
+    return s
+
+
+def clean_folder_name(value: str) -> str:
+    """
+    MappanĂ©vhez (CSOPORT1):
+    - Ă©kezetek eltĂˇvolĂ­tĂˇsa
+    - szĂłkĂ¶z -> -
+    - tiltott karakterek tĂ¶rlĂ©se
+    """
+    s = norm_text(value)
+    if not s:
+        return ""
+
+    # Ă©kezetek le
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+
+    s = s.replace(" ", "-")
+    s = re.sub(r"[^A-Za-z0-9_\-]", "", s)
+    return s
+
+
+def build_shop_image_path(csoport1: str, model: str, slot: int = 1, ext: str = ".jpg") -> str:
+    folder = clean_folder_name(csoport1).lower()
+    base = clean_sku(model)
+
+    if not base or not folder:
+        return ""
+
+    if slot == 1:
+        fname = f"{base}{ext}"
+    else:
+        fname = f"{base}-{slot-1}{ext}"
+
+    return f"product/{folder}/{fname}"
+
+
+def image_alt_from_model(name: str, model: str, *, keyword: str = "horgĂˇsz termĂ©k") -> str:
+    """
+    SEO-barĂˇt ALT:
+    - tartalmazza a termĂ©knevet (ha van)
+    - tartalmazza a modellt/cikkszĂˇmot (ha van)
+    - opcionĂˇlis kulcsszĂł
+    """
+    name = norm_text(name)
+    model = norm_text(model)
+
+    parts = []
+    if name:
+        parts.append(name)
+    if model:
+        parts.append(model)
+
+    base = " - ".join(parts).strip()
+
+    if base and keyword:
+        return f"{base} | {keyword}"
+    if base:
+        return base
+    return "TermĂ©kkĂ©p"
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\log.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\numbers.py
+=============================
+
+from decimal import Decimal, ROUND_UP
+
+
+VAT_RATE = Decimal("1.27")
+ROUND_STEP = Decimal("5")
+
+
+def net_to_gross_rounded_5(net: float | int | Decimal) -> float:
+    """
+    NettĂł -> bruttĂł (27% ĂFA) -> 5 Ft-ra felfelĂ© kerekĂ­tve.
+    """
+    net = Decimal(str(net))
+    gross = net * VAT_RATE
+
+    rounded = (
+        (gross / ROUND_STEP)
+        .to_integral_value(rounding=ROUND_UP)
+        * ROUND_STEP
+    )
+
+    return float(rounded)
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\text.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\utils\time.py
+=============================
+
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\src\app.py
+=============================
+
+# src/app.py
+"""
+Shop Sync - KĂ¶zponti CLI belĂ©pĂ©si pont
+
+CĂ©l
+----
+Ez a modul a teljes szinkron rendszer belĂ©pĂ©si pontja.
+Feladata:
+- beszĂˇllĂ­tĂł kivĂˇlasztĂˇsa (--supplier)
+- futtatĂˇsi mĂłd kivĂˇlasztĂˇsa (--mode)
+- megfelelĹ‘ beszĂˇllĂ­tĂłi modul meghĂ­vĂˇsa
+
+Ez a fĂˇjl NEM tartalmaz ĂĽzleti logikĂˇt.
+A tĂ©nyleges szinkron logika a src/sync/ mappĂˇban talĂˇlhatĂł.
+
+HasznĂˇlat
+---------
+Upsert (create + update):
+    python -m src.app --supplier natura --mode upsert
+
+Delete:
+    python -m src.app --supplier natura --mode delete
+
+MindkettĹ‘:
+    python -m src.app --supplier natura --mode all
+
+Javasolt ĂĽtemezĂ©s
+-----------------
+- upsert: 4 ĂłrĂˇnkĂ©nt
+- delete: napi 1 hajnalban
+
+ArchitektĂşra elv
+----------------
+- SUPPLIERS dict â†’ mely beszĂˇllĂ­tĂłk Ă©rhetĹ‘k el
+- ACTIONS dict â†’ milyen mĹ±veletek Ă©rhetĹ‘k el
+- main() â†’ CLI parsing + dispatch
+
+BĹ‘vĂ­tĂ©s
+-------
+Ăšj beszĂˇllĂ­tĂł hozzĂˇadĂˇsĂˇhoz:
+
+1) KĂ©szĂ­ts Ăşj modult:
+   src/sync/uj_beszallito.py
+
+2) A modulnak implementĂˇlnia kell:
+   - run_upsert()
+   - run_delete()
+
+3) RegisztrĂˇld a SUPPLIERS dict-ben:
+   SUPPLIERS["uj"] = uj_beszallito
+
+Ennyi. A main logikĂˇt nem kell mĂłdosĂ­tani.
+"""
+
+import argparse
+import sys
+import os
+
+from typing import Callable, Dict
+from dotenv import load_dotenv
+
+from src.shoprenter.client import ShoprenterClient
+
+from src.sync import natura
+# kĂ©sĹ‘bb:
+# from src.sync import masik
+
+load_dotenv()
+
+# ==============================================================
+# CLIENT FACTORY
+# ==============================================================
+
+def create_client() -> ShoprenterClient:
+    """
+    LĂ©trehozza a Shoprenter API klienst.
+    Minden supplier ugyanazt a klienst kapja.
+    """
+    return ShoprenterClient(
+        base_url=os.getenv("SHOPRENTER_API_URL"),
+        user=os.getenv("SHOPRENTER_API_USER"),
+        password=os.getenv("SHOPRENTER_API_PASS"),
+    )
+
+# ==============================================================
+# SUPPLIER REGISTRY
+# ==============================================================
+"""
+Itt regisztrĂˇljuk az elĂ©rhetĹ‘ beszĂˇllĂ­tĂłkat.
+
+Kulcs:
+    CLI-bĹ‘l hasznĂˇlhatĂł nĂ©v (--supplier)
+
+Ă‰rtĂ©k:
+    A modul, amely tartalmazza:
+        - run_upsert()
+        - run_delete()
+"""
+SUPPLIERS = {
+    "natura": natura,
+    # "masik": masik,
+}
+
+
+# ==============================================================
+# ACTION REGISTRY
+# ==============================================================
+"""
+Itt definiĂˇljuk az elĂ©rhetĹ‘ mĹ±veleteket (--mode).
+
+Mindegyik action egy fĂĽggvĂ©ny,
+amely megkapja a beszĂˇllĂ­tĂł modult paramĂ©terkĂ©nt.
+"""
+
+
+def run_upsert(supplier, client):
+    """Create + Update futtatĂˇsa."""
+    supplier.run_upsert(client=client)
+
+
+def run_delete(supplier, client):
+    """Delete futtatĂˇsa."""
+    supplier.run_delete(client=client)
+
+
+def run_all(supplier, client):
+    """Upsert majd Delete futtatĂˇsa."""
+    supplier.run_upsert(client=client)
+    supplier.run_delete(client=client)
+
+
+ACTIONS: Dict[str, Callable] = {
+    "upsert": run_upsert,
+    "delete": run_delete,
+    "all": run_all,
+}
+
+
+# ==============================================================
+# MAIN
+# ==============================================================
+
+def main(argv=None) -> int:
+    """
+    CLI argumentum feldolgozĂˇs + dispatch.
+
+    VisszatĂ©rĂ©si kĂłd:
+        0 = siker
+        1 = hiba
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Shop Sync - beszĂˇllĂ­tĂłi szinkron futtatĂł"
+    )
+
+    parser.add_argument(
+        "--supplier",
+        required=True,
+        choices=SUPPLIERS.keys(),
+        help="BeszĂˇllĂ­tĂł neve (pl. natura)",
+    )
+
+    parser.add_argument(
+        "--mode",
+        default="upsert",
+        choices=ACTIONS.keys(),
+        help="MĹ±velet tĂ­pusa: upsert | delete | all",
+    )
+
+    args = parser.parse_args(argv)
+
+    supplier = SUPPLIERS.get(args.supplier)
+    action = ACTIONS.get(args.mode)
+
+    client = create_client()
+
+    try:
+        action(supplier, client)
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\config\suppliers\haldepo\mapping.json
+=============================
+
+{
+  "model": ["CikkszĂˇm"],
+  "gtin": ["EAN"],
+
+  "productDescriptions": ["TermĂ©kleĂ­rĂˇs"],
+  "manufacturer_name": ["GyĂˇrtĂł"],
+
+  "gross_price": ["AjĂˇnlott kisker Ăˇr"],
+  "wholesale_price": ["Nagyker Ăˇr"],
+
+  "mainPicture": ["TermĂ©kkĂ©p 1"],
+  "image1": ["TermĂ©kkĂ©p 2"],
+  "image2": ["TermĂ©kkĂ©p 3"]
+}
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\config\suppliers\haldepo\supplier.json
+=============================
+
+{
+  "name": "haldepo",
+  "type": "csv",
+  "source": {
+    "url": "https://www.haldepo.hu/letoltes/csv"
+  },
+  "encoding": "utf-8",
+  "delimiter": ";",
+  "has_header": true,
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 86400
+  }
+}
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\config\suppliers\natura\mapping.json
+=============================
+
+{
+  "sku": ["NATURASOFTID"],
+  "model": ["product.sku"],
+  "name": ["product_description.name.hu"],
+  "unit_name": ["product_description.quantity_name.hu"],
+  "gross_price": ["BRUTTOAR4"],
+  "wholesale_price": ["BRUTTOAR3"],
+  "manufacturer_name": ["CSOPORT3"],
+  "tax_class_id": ["product.tax_class_id"],
+  "gtin": ["product.gtin"],
+  "csoport1_name": ["CSOPORT1"]
+}
+
+
+=============================
+FILE: C:\Tarhely\shop_sync_api\config\suppliers\natura\supplier.json
+=============================
+
+{
+  "name": "natura",
+  "type": "csv",
+  "source": {
+    "url": "file:///C:/Tarhely/shop_sync_api/data/sources/natura/webaruhaz.csv"
+  },
+  "encoding": "utf-8",
+  "delimiter": ",",
+  "has_header": true,
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 86400
+  }
+}

@@ -4,26 +4,18 @@ src/runner/preview_runner.py
 
 🎯 Cél
 ------
-Ez a preview runner Natura MASTER adatokból Shoprenter kompatibilis
-request payloadokat generál debug/ellenőrzési célra.
+Supplier-centrikus (új) pipeline alapján Shoprenter kompatibilis
+request preview payloadokat generál debug/ellenőrzési célra.
 
-A script NEM hív API-t, csak JSONL és CSV fájlokat ír.
+A script NEM hív Shoprenter API-t, csak JSONL és CSV fájlokat ír.
 
-Támogatott logikai rétegek:
-  1) MASTER_CREATE   (POST /productExtend)
-  2) MASTER_UPDATE   (PUT /productExtend/{id})
-  3) ENRICH_UPDATE   (PUT /productExtend/{id})
-     - description (Haldepó → Natura)
-     - mainPicture (Haldepó kép)
-     - imageAlt (SEO alt)
-     - ❌ nem nyúl árhoz
-     - ❌ nem nyúl státuszhoz
-     - ❌ nem nyúl kategóriához
-  4) DELETE_PREVIEW  (DELETE /productExtend/{id})
-     - placeholder ID-val
-  5) SKU_MAP_PREVIEW (GET /productExtend?page=...)
-     - sku_map építéshez kapcsolódó request sablon
-  + WHOLESALE CSV export (ár override plugin alapján)
+Támogatott logikai rétegek (preview):
+  1) MASTER_CREATE   (POST /productExtend)        -> merged termékből (enrich + pricing után)
+  2) MASTER_UPDATE   (PUT  /productExtend/{id})   -> master termékből
+  3) ENRICH_UPDATE   (PUT  /productExtend/{id})   -> csak ha _enriched_by van
+  4) DELETE_PREVIEW  (DELETE /productExtend/{id}) -> placeholder ID-val
+  5) SKU_MAP_PREVIEW (GET /productExtend?page=...) -> sku_map építéshez sablon
+  + WHOLESALE CSV export (pricing plugin után, merged termékből)
 
 ------------------------------------------------------------
 📦 Kimenetek (--write esetén)
@@ -46,8 +38,14 @@ data/debug/payload/
 SHOPRENTER_API_URL=
     Pl.: https://your-shop.api.myshoprenter.hu
 
+MASTER_SUPPLIER=
+    Pl.: natura (default)
+
 TEST_PRODUCT_SKU=
     Opcionális default SKU szűrés.
+
+HALDEPO_USER / HALDEPO_PASS
+    Haldepó ingesthez (ha pluginek miatt betöltődik)
 
 ------------------------------------------------------------
 🚀 Futtatási példák
@@ -62,70 +60,17 @@ TEST_PRODUCT_SKU=
 3) Egy konkrét SKU tesztelése:
     python -m src.runner.preview_runner --sku 2954 --write
 
-4) ENRICH + wholesale override bekapcsolása:
-    python -m src.runner.preview_runner --with-haldepo --write
-
-5) Limitált elemszám:
+4) Limitált elemszám:
     python -m src.runner.preview_runner --limit 50 --write
 
-6) Csendes mód:
+5) Csendes mód:
     python -m src.runner.preview_runner --write --quiet
 
-7) SKU_MAP preview oldalszám megadása:
+6) SKU_MAP preview oldalszám:
     python -m src.runner.preview_runner --write --sku-map-pages 3
 
-8) DELETE preview ID override:
+7) DELETE preview ID override:
     python -m src.runner.preview_runner --write --delete-id 123456
-
-------------------------------------------------------------
-🧠 Logikai folyamat
-------------------------------------------------------------
-
-1️⃣ Natura = MASTER
-    - ingest
-    - normalize
-
-2️⃣ Haldepó = ENRICHER (ha --with-haldepo)
-    - match_key alapú merge
-    - csak üres mezőket másol
-    - _enriched_by flag kerül a rekordba
-
-3️⃣ Payload generálás:
-    - MASTER_CREATE
-    - MASTER_UPDATE
-    - ENRICH_UPDATE (ha enrich történt)
-    - DELETE preview
-    - SKU_MAP preview
-
-4️⃣ Wholesale CSV:
-    - Natura alap
-    - Haldepó plugin felülírhat
-    - nettó → bruttó
-    - 5-re kerekítés felfelé
-
-------------------------------------------------------------
-🔒 Biztonsági megjegyzés
-------------------------------------------------------------
-
-Ez a runner NEM hív Shoprenter API-t.
-Nem módosít éles adatot.
-Csak preview requesteket generál.
-
-Az éles szinkron a src/shoprenter/sync.py rétegben történik.
-
-------------------------------------------------------------
-📈 Skálázhatóság
-------------------------------------------------------------
-
-A wholesale override plugin alapú.
-Új beszállító hozzáadásához:
-
-  1) írj új plugin osztályt (merge/rules alatt)
-  2) add hozzá a runnerben a plugin listához
-
-Így a rendszer 5–8 beszállítóra is bővíthető
-anélkül, hogy a runner szétágazna.
-
 """
 
 from __future__ import annotations
@@ -133,15 +78,12 @@ from __future__ import annotations
 import os
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from dotenv import load_dotenv
 
-from src.ingest.suppliers_csv import ingest_one_supplier_csv
-import src.normalize.suppliers  # registry bootstrap
-from src.normalize import normalize_rows
-
-from src.shoprenter.payloads_natura import build_payload
+from src.core.pipeline import run_pipeline
+from src.payloads.shoprenter import build_payload, DEFAULT_LANGUAGE_ID
 
 from src.utils.export_debug import (
     reset_file,
@@ -150,39 +92,18 @@ from src.utils.export_debug import (
     append_csv_row,
 )
 
-# NEW: clean enrich engine
-from src.merge.engine import enrich_products
-from src.merge.rules.enrich_registry import get_all_enrich_plugins
-
-from src.merge.rules.haldepo_wholesale import HaldepoWholesalePlugin  # ha még használod
-
 load_dotenv()
 
-LANGUAGE_ID = "bGFuZ3VhZ2UtbGFuZ3VhZ2UfaWQ9MQ=="
 DEBUG_DIR = Path("data/debug/payload")
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
 TEST_PRODUCT_SKU = (os.getenv("TEST_PRODUCT_SKU") or "").strip()
 
 
-# -------------------------------------------------
-# LOADERS
-# -------------------------------------------------
-def load_products(supplier: str, *, verbose: bool) -> List[Dict[str, Any]]:
-    raw = ingest_one_supplier_csv(supplier)
-    products = normalize_rows(supplier, raw)
-    if verbose:
-        print(f"{supplier.upper()}: raw={len(raw)} normalized={len(products)}")
-    return products
-
-
 def safe_base_url() -> str:
     return (os.getenv("SHOPRENTER_API_URL", "") or "").rstrip("/")
 
 
-# -------------------------------------------------
-# HELPERS: request builders (preview only)
-# -------------------------------------------------
 def build_delete_request(*, base_url: str, product_extend_id: str, sku: str) -> Dict[str, Any]:
     return {
         "sku": sku,
@@ -202,25 +123,32 @@ def build_sku_map_preview_request(*, base_url: str, page: int = 1, limit: int = 
     }
 
 
-# -------------------------------------------------
-# MAIN
-# -------------------------------------------------
+def _filter_by_sku(products: List[Dict[str, Any]], sku: str) -> List[Dict[str, Any]]:
+    sku = (sku or "").strip()
+    if not sku:
+        return products
+    return [p for p in products if str(p.get("sku", "")).strip() == sku]
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Shop Sync preview runner (payload + enrich + delete previews)")
+    parser = argparse.ArgumentParser(description="Shop Sync preview runner (supplier-centric pipeline)")
 
     parser.add_argument("--write", action="store_true", help="Write debug output files")
     parser.add_argument("--sku", default=TEST_PRODUCT_SKU, help="Only process this SKU (or env TEST_PRODUCT_SKU)")
     parser.add_argument("--limit", type=int, default=0, help="Limit processed products (0 = no limit)")
     parser.add_argument("--quiet", action="store_true", help="Less console output")
 
-    # ENRICH: csak 'all' vagy üres (disabled)
-    parser.add_argument("--enrich", default="", help="Enrich mode: 'all' or empty (disabled)")
+    parser.add_argument("--master", default=os.getenv("MASTER_SUPPLIER", "natura"), help="Master supplier name")
 
     # delete previewhoz: id placeholder vagy konkrét id
     parser.add_argument("--delete-id", default="PRODUCT_EXTEND_ID_HERE", help="Delete preview ID placeholder")
 
     # sku_map preview GET requestek száma
     parser.add_argument("--sku-map-pages", type=int, default=1, help="How many SKU_MAP preview GET requests to write")
+
+    # pipeline flags
+    parser.add_argument("--no-enrich", action="store_true", help="Disable enrich phase")
+    parser.add_argument("--no-pricing", action="store_true", help="Disable pricing phase")
 
     args = parser.parse_args()
     verbose = not args.quiet
@@ -229,72 +157,39 @@ def main() -> None:
     if not base_url and verbose:
         print("WARN: SHOPRENTER_API_URL nincs beállítva (.env). A 'uri' mezők relative formában készülnek.")
 
-    # 1) MASTER: Natura
-    natura_products = load_products("natura", verbose=verbose)
+    # -------------------------------------------------
+    # 1) Pipeline (master -> enrich -> pricing)
+    # -------------------------------------------------
+    res = run_pipeline(
+        master_supplier=args.master,
+        enable_enrich=not args.no_enrich,
+        enable_pricing=not args.no_pricing,
+    )
 
-    # SKU filter
+    master_products = list(res.master)
+    merged_products = list(res.merged)
+
+    # SKU filter (MASTER SKU alapján)
     sku_filter = (args.sku or "").strip()
     if sku_filter:
-        natura_products = [p for p in natura_products if str(p.get("sku", "")).strip() == sku_filter]
-        if not natura_products:
-            raise RuntimeError(f"Nincs ilyen SKU Naturában: {sku_filter}")
+        master_products = _filter_by_sku(master_products, sku_filter)
+        merged_products = _filter_by_sku(merged_products, sku_filter)
+        if not master_products:
+            raise RuntimeError(f"Nincs ilyen SKU a masterben ({args.master}): {sku_filter}")
 
+    # Limit (a sorrend maradjon összepárosítható)
     if args.limit and args.limit > 0:
-        natura_products = natura_products[: args.limit]
+        master_products = master_products[: args.limit]
+        merged_products = merged_products[: args.limit]
 
     if verbose:
-        print(f"PROCESSING: {len(natura_products)} product(s)")
+        print(f"MASTER={args.master} master_count={len(res.master)} merged_count={len(res.merged)}")
+        print(f"PROCESSING: {len(master_products)} product(s)")
+        if isinstance(res.stats, dict):
+            print("PIPELINE stats:", res.stats)
 
     # -------------------------------------------------
-    # 2) ENRICH (engine) + supplier cache
-    # -------------------------------------------------
-    enrich_mode = (args.enrich or "").strip().lower()
-    enrich_plugins = get_all_enrich_plugins() if enrich_mode == "all" else []
-
-    supplier_rows_cache: Dict[str, List[Dict[str, Any]]] = {}
-    if enrich_plugins:
-        for plg in enrich_plugins:
-            # NEW interface: plugin.name is the supplier key
-            sname = getattr(plg, "name", "")
-            if not sname:
-                raise RuntimeError(f"Invalid enrich plugin without name: {plg}")
-
-            if sname not in supplier_rows_cache:
-                supplier_rows_cache[sname] = load_products(sname, verbose=verbose)
-
-        enrich_res = enrich_products(
-            master_products=natura_products,
-            supplier_data=supplier_rows_cache,
-            plugins=enrich_plugins,
-        )
-        merged_products = enrich_res.products
-
-        if verbose:
-            print("ENRICH stats:", enrich_res.stats)
-    else:
-        merged_products = [dict(p) for p in natura_products]
-
-    # -------------------------------------------------
-    # 3) WHOLESALE plugin (maradhat külön, v1)
-    # -------------------------------------------------
-    wholesale_plugins: list[Any] = []
-    wholesale_indexes: dict[str, Any] = {}
-
-    try:
-        # jelen logika: ha enrichben volt haldepo, akkor töltsük wholesale-hoz is
-        has_haldepo = "haldepo" in supplier_rows_cache
-        if has_haldepo:
-            hp = HaldepoWholesalePlugin()
-            wholesale_plugins.append(hp)
-
-            haldepo_rows = supplier_rows_cache["haldepo"]
-            wholesale_indexes[hp.name] = hp.build_indexes(haldepo_rows)
-    except Exception as e:
-        if verbose:
-            print("WARN: wholesale plugin init failed:", e)
-
-    # -------------------------------------------------
-    # 4) Output fájlok
+    # 2) Output fájlok
     # -------------------------------------------------
     out_master_create = DEBUG_DIR / "master_create_all.jsonl"
     out_master_update = DEBUG_DIR / "master_update_all.jsonl"
@@ -311,6 +206,7 @@ def main() -> None:
         reset_file(out_delete)
         reset_file(out_sku_map)
         reset_file(out_errors)
+
         init_csv(out_wholesale, ["sku", "model", "gross_price", "wholesale_price", "supplier"])
 
         for page in range(1, max(1, args.sku_map_pages) + 1):
@@ -320,16 +216,15 @@ def main() -> None:
     err_count = 0
 
     # -------------------------------------------------
-    # 5) FŐ LOOP (MASTER + ENRICH_UPDATE + DELETE + WHOLESALE CSV)
+    # 3) FŐ LOOP (MASTER + ENRICH_UPDATE + DELETE + WHOLESALE CSV)
     # -------------------------------------------------
-    # merged_products és natura_products ugyanannyi elem (enrich engine megtartja a sorrendet)
-    for p_master, p_merged in zip(natura_products, merged_products):
+    for p_master, p_merged in zip(master_products, merged_products):
         sku = str(p_master.get("sku", "")).strip()
         model = (p_master.get("model") or "").strip() or sku
 
         enriched_any = bool((p_merged.get("_enriched_by") or "").strip())
 
-        # MASTER CREATE (merged mehet create-be: kép/leírás beépül)
+        # MASTER CREATE: merged (enrich+pricing után)
         try:
             payload = {
                 "sku": sku,
@@ -338,7 +233,7 @@ def main() -> None:
                 "data": build_payload(
                     "MASTER_CREATE",
                     p_merged,
-                    language_id=LANGUAGE_ID,
+                    language_id=DEFAULT_LANGUAGE_ID,
                     status_value=0,
                     stock1=0,
                 ),
@@ -351,7 +246,7 @@ def main() -> None:
             if args.write:
                 append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_CREATE", "error": str(e)})
 
-        # MASTER UPDATE (policy: masterből)
+        # MASTER UPDATE: masterből (policy: “csak master update”)
         try:
             payload = {
                 "sku": sku,
@@ -360,7 +255,7 @@ def main() -> None:
                 "data": build_payload(
                     "MASTER_UPDATE",
                     p_master,
-                    language_id=LANGUAGE_ID,
+                    language_id=DEFAULT_LANGUAGE_ID,
                 ),
             }
             ok_update += 1
@@ -371,14 +266,14 @@ def main() -> None:
             if args.write:
                 append_jsonl(out_errors, {"sku": sku, "stage": "MASTER_UPDATE", "error": str(e)})
 
-        # ENRICH UPDATE (csak ha tényleg történt enrich)
+        # ENRICH UPDATE: csak ha tényleg történt enrich
         try:
             if enriched_any:
                 payload = {
                     "sku": sku,
                     "method": "PUT",
                     "uri": f"{base_url}/productExtend/PRODUCT_EXTEND_ID_HERE" if base_url else "/productExtend/PRODUCT_EXTEND_ID_HERE",
-                    "data": build_payload("ENRICH_UPDATE", p_merged, language_id=LANGUAGE_ID),
+                    "data": build_payload("ENRICH_UPDATE", p_merged, language_id=DEFAULT_LANGUAGE_ID),
                 }
                 ok_enrich += 1
                 if args.write:
@@ -403,16 +298,13 @@ def main() -> None:
             if args.write:
                 append_jsonl(out_errors, {"sku": sku, "stage": "DELETE_PREVIEW", "error": str(e)})
 
-        # WHOLESALE CSV (master alap, plugin felülírhat)
+        # WHOLESALE CSV: merged (pricing plugin után)
         try:
-            gp = p_master.get("gross_price")
-            wp = p_master.get("wholesale_price")
-            supplier = "natura"
+            gp = p_merged.get("gross_price")
+            wp = p_merged.get("wholesale_price")
 
-            for plg in wholesale_plugins:
-                res = plg.apply(master=p_master, indexes=wholesale_indexes.get(plg.name, {}))
-                if getattr(res, "supplier", "natura") != "natura":
-                    gp, wp, supplier = res.gross_price, res.wholesale_price, res.supplier
+            # ki írta felül? pricing plugin teheti bele _priced_by-t
+            supplier = (p_merged.get("_priced_by") or "").strip() or (p_merged.get("supplier") or "natura")
 
             ok_wholesale += 1
             if args.write:
@@ -442,7 +334,7 @@ def main() -> None:
             f"errors={err_count}"
         )
         if args.write:
-            print("Files saved to:", DEBUG_DIR)
+            print("Files saved to:", DEBUG_DIR.resolve())
 
 
 if __name__ == "__main__":
