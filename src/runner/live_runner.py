@@ -1,4 +1,3 @@
-# src/runner/live_runner.py
 from __future__ import annotations
 
 import json
@@ -15,6 +14,7 @@ from src.core.pipeline import run_pipeline
 from src.payloads.shoprenter import build_payload, DEFAULT_LANGUAGE_ID
 from src.shoprenter.client import ShoprenterClient
 from src.shoprenter.lookups import build_product_sku_map
+from src.utils.images import prepare_shoprenter_image_upload
 from src.utils.log import setup_logging
 
 load_dotenv()
@@ -117,6 +117,64 @@ def _update_with_retry(
         raise last_exc
 
 
+def _upload_file_with_retry(
+    client: ShoprenterClient,
+    *,
+    file_path: str,
+    base64_content: str,
+    max_retries: int = 6,
+    base_sleep: float = 1.5,
+    per_request_sleep: float = 0.60,
+) -> dict:
+    """
+    Shoprenter file upload throttling + retry 429/5xx esetén.
+    """
+    last_exc = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.upload_file(
+                file_path=file_path,
+                base64_content=base64_content,
+                file_type="image",
+            )
+            time.sleep(per_request_sleep)
+            return resp
+
+        except requests.HTTPError as e:
+            last_exc = e
+            status = getattr(e.response, "status_code", None)
+
+            if status in {429, 500, 502, 503, 504} and attempt < max_retries:
+                retry_after = None
+                try:
+                    retry_after = e.response.headers.get("Retry-After")
+                except Exception:
+                    retry_after = None
+
+                if retry_after:
+                    try:
+                        sleep_s = float(retry_after)
+                    except ValueError:
+                        sleep_s = base_sleep * (2 ** attempt)
+                else:
+                    sleep_s = base_sleep * (2 ** attempt)
+
+                time.sleep(sleep_s)
+                continue
+
+            raise
+
+        except Exception as e:
+            last_exc = e
+            raise
+
+    if last_exc:
+        raise last_exc
+
+    return {}
+
+
 def _save_failed_payload(prefix: str, sku: str, payload: dict) -> None:
     fail_dir = Path("data/debug/failed_payloads")
     fail_dir.mkdir(parents=True, exist_ok=True)
@@ -128,6 +186,77 @@ def _save_failed_payload(prefix: str, sku: str, payload: dict) -> None:
     ) as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
+
+def _resolve_enrich_main_picture(
+    client: ShoprenterClient,
+    product: dict,
+    *,
+    log,
+) -> dict:
+    """
+    Ha van külső enrich kép URL, megpróbálja feltölteni Shoprenterbe.
+    Ha a kép letöltése/feltöltése nem sikerül, attól még az enrich update
+    tovább mehet leírással, csak kép nélkül.
+    """
+    p = dict(product)
+
+    image_urls = p.get("image_urls")
+    if not isinstance(image_urls, list) or not image_urls:
+        return p
+
+    image_url = str(image_urls[0] or "").strip()
+    if not image_url:
+        return p
+
+    if image_url.startswith("product/"):
+        p["shoprenter_main_picture"] = image_url
+        return p
+
+    supplier_name = str(
+        p.get("_enriched_by")
+        or p.get("supplier")
+        or ""
+    ).strip().lower() or "supplier"
+
+    sku = str(p.get("sku") or "").strip() or None
+    model = str(p.get("model") or "").strip() or sku
+
+    try:
+        prepared = prepare_shoprenter_image_upload(
+            supplier_name=supplier_name,
+            image_url=image_url,
+            sku=sku,
+            model=model,
+        )
+
+        _upload_file_with_retry(
+            client,
+            file_path=prepared["file_path"],
+            base64_content=prepared["base64_data"],
+            max_retries=int(os.getenv("SHOPRENTER_RETRY_MAX", "6")),
+            base_sleep=float(os.getenv("SHOPRENTER_RETRY_BASE_SLEEP", "1.5")),
+            per_request_sleep=float(os.getenv("SHOPRENTER_REQUEST_SLEEP", "0.60")),
+        )
+
+        p["shoprenter_main_picture"] = prepared["file_path"]
+
+        log.info(
+            "ENRICH image uploaded sku=%s supplier=%s path=%s",
+            sku,
+            supplier_name,
+            prepared["file_path"],
+        )
+
+    except Exception as e:
+        log.warning(
+            "ENRICH image skipped sku=%s supplier=%s url=%s error=%s",
+            sku,
+            supplier_name,
+            image_url,
+            e,
+        )
+
+    return p
 
 def run_master_create_all(*, master_supplier: str) -> RunStats:
     log = setup_logging()
@@ -336,9 +465,15 @@ def run_enrich_update_all(*, master_supplier: str) -> RunStats:
             continue
 
         try:
+            prepared_product = _resolve_enrich_main_picture(
+                client,
+                dict(p),
+                log=log,
+            )
+
             payload = build_payload(
                 "ENRICH_UPDATE",
-                dict(p),
+                prepared_product,
                 language_id=DEFAULT_LANGUAGE_ID,
                 product_id=pid,
             )

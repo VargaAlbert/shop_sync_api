@@ -73,18 +73,21 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "productCategoryRelations",
         "mainPicture",
         "imageAlt",
+        "_post_actions",
     },
     "MASTER_UPDATE": {
         "sku",
         "modelNumber",
         "gtin",
         "price",
+        "_post_actions",
     },
     "ENRICH_UPDATE": {
         "sku",
         "productDescriptions",
         "mainPicture",
         "imageAlt",
+        "_post_actions",
     },
     "WHOLESALE_PRICE_UPDATE": {
         "sku",
@@ -141,6 +144,20 @@ def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
             return v
     return None
 
+def _pick_prepared_shoprenter_main_image(p: Dict[str, Any]) -> Optional[str]:
+    """
+    Előnyben részesítjük azt a képet, amit a live_runner már feltöltött
+    a Shoprenter /files endpointon, és belső file pathként adott vissza.
+    """
+    for k in (
+        "shoprenter_main_picture",
+        "_shoprenter_main_picture",
+        "resolved_main_picture",
+    ):
+        v = str(p.get(k) or "").strip()
+        if v:
+            return v
+    return None
 
 def load_category_map_for_supplier(supplier_name: str) -> Optional[Dict[str, str]]:
     p = Path("config") / "suppliers" / supplier_name / "category_map.json"
@@ -226,7 +243,6 @@ def _build_product_descriptions_for_enrich(
         "description": desc_hu,
     }
     return [item]
-
 
 # ---------------------------------------------------------------------
 # Mode-specifikus builder-ek
@@ -320,6 +336,7 @@ def build_enrich_update_payload(
     - csak akkor ad payloadot, ha van tényleges leírás
     - productDescriptions Shoprenter-kompatibilis formában épül
     - product_id nélkül nem építünk leírás payloadot
+    - ha a runner már feltöltötte a képet, azt használjuk mainPicture-ként
     """
     sku = _require_str(p, "sku", ctx="enrich_update")
 
@@ -331,8 +348,11 @@ def build_enrich_update_payload(
         raise ValueError(f"Missing product_id (enrich_update sku={sku})")
 
     name_hu = _pick_name_hu(p)
-    main_img = _pick_main_image(p)
     model = str(p.get("model") or "").strip() or sku
+
+    main_img = _pick_prepared_shoprenter_main_image(p)
+    if not main_img:
+        main_img = _pick_main_image(p)
 
     payload: Dict[str, Any] = {
         "sku": sku,
@@ -347,7 +367,6 @@ def build_enrich_update_payload(
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["ENRICH_UPDATE"])
-
 
 def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
     sku = _require_str(p, "sku", ctx="wholesale_price_update")
@@ -370,7 +389,6 @@ def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["WHOLESALE_PRICE_UPDATE"])
-
 
 # ---------------------------------------------------------------------
 # build_payload registry
