@@ -1,6 +1,7 @@
 {
   "name": "haldepo",
   "type": "csv",
+  
   "source": {
     "url": "https://www.haldepo.hu/letoltes/csv"
   },

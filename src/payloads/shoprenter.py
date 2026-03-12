@@ -5,16 +5,15 @@ payloads.shoprenter
 
 Egységes belső Product dict -> Shoprenter productExtend payload builder-ek.
 
-Ez a modul supplier-agnosztikus: a core pipeline által előállított egységes
-Product dict (src/core/model.py) mezőire támaszkodik.
+Publikus API:
+- build_payload(mode, p, **kwargs)
 
-Publikus API a runner felé:
-- build_product_extend_from_product(p) -> FULL payload (CREATE-hez)
-- build_update_payload_from_full(full) -> minimal UPDATE payload (PUT-hoz)
-
-Kompatibilitás:
-- megmarad a build_payload(mode, p, ...) registry-s API is
-  (MASTER_CREATE / MASTER_UPDATE / ENRICH_UPDATE / WHOLESALE_PRICE_UPDATE)
+Fő elvek:
+- MASTER_CREATE: teljes create payload
+- MASTER_UPDATE: csak alap mezők, productDescriptions NINCS
+- ENRICH_UPDATE: csak akkor épül, ha van tényleges leírás
+- ENRICH_UPDATE productDescriptions már Shoprenter-kompatibilis:
+    product + language + name + description
 """
 
 from typing import Any, Dict, Mapping, Optional, Set, Literal, Callable, TypedDict
@@ -26,14 +25,21 @@ from src.utils.images import build_shop_image_path, image_alt_from_model
 
 
 # ---------------------------------------------------------------------
-# Defaults (ha nem adsz át paramétert)
+# Defaults
 # ---------------------------------------------------------------------
-DEFAULT_LANGUAGE_ID = os.getenv("SHOPRENTER_LANGUAGE_ID", "bGFuZ3VhZ2UtbGFuZ3VhZ2UfaWQ9MQ==")
+# FONTOS:
+# Ez legyen a shopban ténylegesen létező language resource ID.
+# Ha nem jó, ENRICH_UPDATE-nél 40007 hibát kapsz.
+DEFAULT_LANGUAGE_ID = os.getenv(
+    "SHOPRENTER_LANGUAGE_ID",
+    "bGFuZ3VhZ2UtbGFuZ3VhZ2VfaWQ9MQ==",
+)
 
-# Állítsd be a saját shoprenter default category id-dre, ha kell
-DEFAULT_CATEGORY_ID = os.getenv("SHOPRENTER_DEFAULT_CATEGORY_ID", "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4")
+DEFAULT_CATEGORY_ID = os.getenv(
+    "SHOPRENTER_DEFAULT_CATEGORY_ID",
+    "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4",
+)
 
-# Nagyker csoport neve
 WHOLESALE_GROUP_NAME_DEFAULT = os.getenv("WHOLESALE_GROUP_NAME", "NAGYKER")
 
 
@@ -46,7 +52,7 @@ PayloadMode = Literal[
 
 
 # ---------------------------------------------------------------------
-# Field sets (PUT-nál ne írjunk felül fölösleges mezőket)
+# Field sets
 # ---------------------------------------------------------------------
 class PayloadFieldSets(TypedDict):
     MASTER_CREATE: Set[str]
@@ -65,7 +71,6 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "stock1",
         "productDescriptions",
         "productCategoryRelations",
-        "_post_actions",
         "mainPicture",
         "imageAlt",
     },
@@ -74,8 +79,6 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "modelNumber",
         "gtin",
         "price",
-        "productDescriptions",
-        "_post_actions",
     },
     "ENRICH_UPDATE": {
         "sku",
@@ -96,7 +99,6 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
 # Generic helpers
 # ---------------------------------------------------------------------
 def filter_payload(data: Dict[str, Any], fields: Set[str]) -> Dict[str, Any]:
-    # None értékeket is dobjuk (Shoprenter sokszor nem szereti)
     return {k: v for k, v in data.items() if k in fields and v is not None}
 
 
@@ -113,16 +115,15 @@ def _require_str(p: Dict[str, Any], key: str, *, ctx: str) -> str:
 
 def _pick_name_hu(p: Dict[str, Any]) -> str:
     for k in ("name_hu", "product_name_hu", "name", "title_hu"):
-        v = (p.get(k) or "").strip()
+        v = str(p.get(k) or "").strip()
         if v:
             return v
-    # fallback: sku
     return _require_str(p, "sku", ctx="name_fallback")
 
 
 def _pick_desc_hu(p: Dict[str, Any]) -> str:
     for k in ("description_hu", "desc_hu", "description"):
-        v = (p.get(k) or "").strip()
+        v = str(p.get(k) or "").strip()
         if v:
             return v
     return ""
@@ -135,17 +136,13 @@ def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
         return u0 or None
 
     for k in ("main_image", "image_url", "image", "mainPicture"):
-        v = (p.get(k) or "").strip()
+        v = str(p.get(k) or "").strip()
         if v:
             return v
     return None
 
 
 def load_category_map_for_supplier(supplier_name: str) -> Optional[Dict[str, str]]:
-    """
-    Opcionális helper:
-    config/suppliers/<supplier>/category_map.json
-    """
     p = Path("config") / "suppliers" / supplier_name / "category_map.json"
     if not p.exists():
         return None
@@ -161,24 +158,20 @@ def _resolve_category_id(
     category_id: Optional[str],
     category_map: Optional[Mapping[str, str]],
 ) -> str:
-    # 1) explicit param
     if category_id:
         return category_id
 
-    # 2) category_map alapján név->id
     if category_map:
         for k in ("category", "category_name", "group1", "CSOPORT1", "csoport1_name"):
-            name = (p.get(k) or "").strip()
+            name = str(p.get(k) or "").strip()
             if name and name in category_map:
                 return category_map[name]
 
-    # 3) ha már eleve id jön a termékben
     for k in ("category_id", "shoprenter_category_id"):
-        v = (p.get(k) or "").strip()
+        v = str(p.get(k) or "").strip()
         if v:
             return v
 
-    # 4) default
     return DEFAULT_CATEGORY_ID
 
 
@@ -195,6 +188,44 @@ def _wholesale_post_actions(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             }
         ]
     }
+
+
+def _build_product_descriptions_for_create_or_update(
+    *,
+    language_id: str,
+    name_hu: str,
+    desc_hu: str,
+) -> list[Dict[str, Any]]:
+    """
+    CREATE esetén a régi egyszerű struktúra maradhat.
+    """
+    item: Dict[str, Any] = {
+        "language_id": language_id,
+        "name": name_hu,
+    }
+    if desc_hu:
+        item["description"] = desc_hu
+    return [item]
+
+
+def _build_product_descriptions_for_enrich(
+    *,
+    product_id: str,
+    language_id: str,
+    name_hu: str,
+    desc_hu: str,
+) -> list[Dict[str, Any]]:
+    """
+    ENRICH_UPDATE esetén a Shoprenter productDescriptions elemhez
+    product + language kapcsolat is kell.
+    """
+    item: Dict[str, Any] = {
+        "product": {"id": product_id},
+        "language": {"id": language_id},
+        "name": name_hu,
+        "description": desc_hu,
+    }
+    return [item]
 
 
 # ---------------------------------------------------------------------
@@ -215,29 +246,20 @@ def build_master_create_payload(
     if gross is None:
         raise ValueError(f"Missing gross_price (master_create sku={sku})")
 
-    model = (p.get("model") or "").strip() or sku
-    gtin = (p.get("gtin") or p.get("ean") or "").strip() or None
+    model = str(p.get("model") or "").strip() or sku
+    gtin = str(p.get("gtin") or p.get("ean") or "").strip() or None
 
     name_hu = _pick_name_hu(p)
     desc_hu = _pick_desc_hu(p)
     cat_id = _resolve_category_id(p, category_id=category_id, category_map=category_map)
 
-    # 1) enrich kép (ha van image_urls[0])
     main_img = _pick_main_image(p)
 
-    # 2) fallback: product/{CSOPORT1}/{model}.jpg (ha natura-szerű termék)
     if not main_img:
-        csoport1 = (p.get("csoport1_name") or "").strip()
+        csoport1 = str(p.get("csoport1_name") or "").strip()
         generated = build_shop_image_path(csoport1, model, slot=1, ext=".jpg")
         if generated:
             main_img = generated
-
-    pd: Dict[str, Any] = {
-        "language_id": language_id,
-        "name": name_hu,
-    }
-    if desc_hu:
-        pd["description"] = desc_hu
 
     payload: Dict[str, Any] = {
         "sku": sku,
@@ -246,11 +268,14 @@ def build_master_create_payload(
         "price": _fmt_price(float(gross)),
         "status": int(status_value),
         "stock1": int(stock1),
-        "productDescriptions": [pd],
+        "productDescriptions": _build_product_descriptions_for_create_or_update(
+            language_id=language_id,
+            name_hu=name_hu,
+            desc_hu=desc_hu,
+        ),
         "productCategoryRelations": [{"category_id": cat_id}],
         "mainPicture": main_img,
         "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
-        "_post_actions": _wholesale_post_actions(p),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_CREATE"])
@@ -261,32 +286,24 @@ def build_master_update_payload(
     *,
     language_id: str,
 ) -> Dict[str, Any]:
+    """
+    MASTER_UPDATE = csak alap mezők.
+    NINCS productDescriptions.
+    """
     sku = _require_str(p, "sku", ctx="master_update")
 
     gross = p.get("gross_price")
     if gross is None:
         raise ValueError(f"Missing gross_price (master_update sku={sku})")
 
-    model = (p.get("model") or "").strip() or sku
-    gtin = (p.get("gtin") or p.get("ean") or "").strip() or None
-
-    name_hu = _pick_name_hu(p)
-    desc_hu = _pick_desc_hu(p)
-
-    pd: Dict[str, Any] = {
-        "language_id": language_id,
-        "name": name_hu,
-    }
-    if desc_hu:
-        pd["description"] = desc_hu
+    model = str(p.get("model") or "").strip() or sku
+    gtin = str(p.get("gtin") or p.get("ean") or "").strip() or None
 
     payload: Dict[str, Any] = {
         "sku": sku,
         "modelNumber": model,
         "gtin": gtin,
         "price": _fmt_price(float(gross)),
-        "productDescriptions": [pd],
-        "_post_actions": _wholesale_post_actions(p),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
@@ -296,26 +313,35 @@ def build_enrich_update_payload(
     p: Dict[str, Any],
     *,
     language_id: str,
+    product_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    ENRICH_UPDATE:
+    - csak akkor ad payloadot, ha van tényleges leírás
+    - productDescriptions Shoprenter-kompatibilis formában épül
+    - product_id nélkül nem építünk leírás payloadot
+    """
     sku = _require_str(p, "sku", ctx="enrich_update")
 
-    name_hu = _pick_name_hu(p)
     desc_hu = _pick_desc_hu(p)
+    if not desc_hu:
+        return {}
 
-    main_img = _pick_main_image(p)  # enrich képek jellemzően teljes URL-ek
+    if not product_id:
+        raise ValueError(f"Missing product_id (enrich_update sku={sku})")
 
-    model = (p.get("model") or "").strip() or sku
-
-    pd: Dict[str, Any] = {
-        "language_id": language_id,
-        "name": name_hu,
-    }
-    if desc_hu:
-        pd["description"] = desc_hu
+    name_hu = _pick_name_hu(p)
+    main_img = _pick_main_image(p)
+    model = str(p.get("model") or "").strip() or sku
 
     payload: Dict[str, Any] = {
         "sku": sku,
-        "productDescriptions": [pd],
+        "productDescriptions": _build_product_descriptions_for_enrich(
+            product_id=product_id,
+            language_id=language_id,
+            name_hu=name_hu,
+            desc_hu=desc_hu,
+        ),
         "mainPicture": main_img,
         "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
     }
@@ -330,7 +356,7 @@ def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
     if gross is None:
         raise ValueError(f"Missing gross_price (wholesale_price_update sku={sku})")
 
-    model = (p.get("model") or "").strip() or sku
+    model = str(p.get("model") or "").strip() or sku
 
     post_actions = _wholesale_post_actions(p)
     if not post_actions:
@@ -347,7 +373,7 @@ def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
-# build_payload registry (kompatibilitás a régi runner/logika felé)
+# build_payload registry
 # ---------------------------------------------------------------------
 _BUILDERS: Dict[PayloadMode, Callable[..., Dict[str, Any]]] = {
     "MASTER_CREATE": build_master_create_payload,
@@ -358,17 +384,13 @@ _BUILDERS: Dict[PayloadMode, Callable[..., Dict[str, Any]]] = {
 
 
 def build_payload(mode: PayloadMode, p: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    """
-    Régi kompat API:
-      build_payload("MASTER_CREATE", p, language_id=..., ...)
-    """
     if mode not in _BUILDERS:
         raise KeyError(f"Unknown payload mode: {mode}")
     return _BUILDERS[mode](p, **kwargs)
 
 
 # ---------------------------------------------------------------------
-# ÚJ, runner-friendly API (amit a supplier-centrikus runner használ)
+# Runner-friendly API
 # ---------------------------------------------------------------------
 def build_product_extend_from_product(
     p: Dict[str, Any],
@@ -379,15 +401,8 @@ def build_product_extend_from_product(
     category_id: Optional[str] = None,
     category_map: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Egységes Product -> FULL payload.
-
-    Default policy:
-    - MASTER_CREATE builder-t használjuk (FULL, biztonságos mezőkkel szűrve).
-    - category_map nincs megadva? ha p["supplier"] alapján található configból, betöltjük.
-    """
     if category_map is None:
-        sname = (p.get("supplier") or "").strip().lower()
+        sname = str(p.get("supplier") or "").strip().lower()
         if sname:
             category_map = load_category_map_for_supplier(sname)
 
@@ -402,10 +417,4 @@ def build_product_extend_from_product(
 
 
 def build_update_payload_from_full(full_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    FULL payload -> minimal update payload.
-
-    Default policy: MASTER_UPDATE field set.
-    (PUT-tal ne küldj category relationt, status/stock mezőket, stb.)
-    """
     return filter_payload(dict(full_payload), PAYLOAD_FIELDS["MASTER_UPDATE"])

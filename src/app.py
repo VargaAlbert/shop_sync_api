@@ -1,185 +1,204 @@
+"""
+Shop Sync Runner
+================
+Ez az alkalmazás a beszállítói adatokat feldolgozza és a Shoprenter API-n keresztül
+szinkronizálja a webshop termékeit.
+
+A rendszer 4 külön "csatornát" kezel:
+
+1. MASTER_CREATE_ALL
+   ------------------
+   Új termékeket hoz létre a Shoprenterben a master beszállító alapján.
+   Csak azokat a SKU-kat hozza létre, amelyek még nem léteznek a Shoprenterben.
+
+2. MASTER_UPDATE_ALL
+   ------------------
+   A már létező termékek alapadatait frissíti:
+   - ár
+   - készlet
+   - név
+   - alap termékadatok
+
+3. ENRICH_UPDATE_ALL
+   ------------------
+   Kiegészítő adatokat frissít:
+   - leírás
+   - képek
+   - egyéb enrich adatok
+
+   Csak azokon a termékeken fut le, ahol az enrich pipeline
+   tényleges változást talált.
+
+4. DELETE_ALL
+   ------------------
+   Azokat a termékeket törli a Shoprenterből,
+   amelyek már nem szerepelnek a master beszállító listájában.
+
+   FONTOS:
+   A törlés csak akkor történik meg ha a .env fájlban:
+
+       DELETE_ENABLED=1
+
+   Ha ez nincs beállítva, a törlés automatikusan skipelődik
+   biztonsági okból.
+
+--------------------------------------------------------------------
+PARANCS SOROS FUTTATÁS
+--------------------------------------------------------------------
+
+A program a projekt gyökérkönyvtárából futtatható.
+
+Windows / Linux / Mac:
+
+    python -m src.app --mode master_create_all
+    python -m src.app --mode master_update_all
+    python -m src.app --mode enrich_update_all
+    python -m src.app --mode delete_all
+
+--------------------------------------------------------------------
+MASTER SUPPLIER MEGADÁSA
+--------------------------------------------------------------------
+
+Alapértelmezett master beszállító a .env fájlban:
+
+    MASTER_SUPPLIER=natura
+
+De parancssorban felülírható:
+
+    python -m src.app --mode master_update_all --master natura
+
+--------------------------------------------------------------------
+TESZTELÉSI SORREND (AJÁNLOTT)
+--------------------------------------------------------------------
+1 Új termékek létrehozása
+
+    python -m src.app --mode master_create_all
+
+2 Termékek frissítése
+
+    python -m src.app --mode master_update_all
+
+3 Enrich adatok frissítése (képek, leírás)
+
+    python -m src.app --mode enrich_update_all
+
+4 Törlés tesztelése
+
+    python -m src.app --mode delete_all
+
+--------------------------------------------------------------------
+AJÁNLOTT NAPI ÜTEMEZÉS
+--------------------------------------------------------------------
+MASTER_CREATE + MASTER_UPDATE
+
+    07:00
+    11:00
+    15:00
+    18:00
+    00:00
+
+ENRICH_UPDATE
+
+    03:00
+
+DELETE_ALL
+
+    06:00
+
+--------------------------------------------------------------------
+LOGOK
+--------------------------------------------------------------------
+A rendszer automatikusan logol ide:
+
+    data/logs/shop_sync.log
+
+A log tartalmazza:
+
+    - futási idő
+    - feldolgozott termékek száma
+    - hibák
+    - API válaszok
+
+--------------------------------------------------------------------
+PÉLDA TELJES TESZT FUTTATÁS
+--------------------------------------------------------------------
+
+Fejlesztés közben érdemes így végigfuttatni:
+
+    python -m src.app --mode master_create_all
+    python -m src.app --mode master_update_all
+    python -m src.app --mode enrich_update_all
+
+--------------------------------------------------------------------
+FONTOS
+--------------------------------------------------------------------
+A delete művelet csak akkor fut le ha:
+
+    DELETE_ENABLED=1
+
+Ez védi a webshopot véletlen tömeges törlés ellen.
+
+"""
 # src/app.py
-"""
-Shop Sync - Központi CLI belépési pont
-
-Cél
-----
-Ez a modul a teljes szinkron rendszer belépési pontja.
-Feladata:
-- beszállító kiválasztása (--supplier)
-- futtatási mód kiválasztása (--mode)
-- megfelelő beszállítói modul meghívása
-
-Ez a fájl NEM tartalmaz üzleti logikát.
-A tényleges szinkron logika a src/sync/ mappában található.
-
-Használat
----------
-Upsert (create + update):
-    python -m src.app --supplier natura --mode upsert
-
-Delete:
-    python -m src.app --supplier natura --mode delete
-
-Mindkettő:
-    python -m src.app --supplier natura --mode all
-
-Javasolt ütemezés
------------------
-- upsert: 4 óránként
-- delete: napi 1 hajnalban
-
-Architektúra elv
-----------------
-- SUPPLIERS dict → mely beszállítók érhetők el
-- ACTIONS dict → milyen műveletek érhetők el
-- main() → CLI parsing + dispatch
-
-Bővítés
--------
-Új beszállító hozzáadásához:
-
-1) Készíts új modult:
-   src/sync/uj_beszallito.py
-
-2) A modulnak implementálnia kell:
-   - run_upsert()
-   - run_delete()
-
-3) Regisztráld a SUPPLIERS dict-ben:
-   SUPPLIERS["uj"] = uj_beszallito
-
-Ennyi. A main logikát nem kell módosítani.
-"""
+from __future__ import annotations
 
 import argparse
-import sys
 import os
-
-from typing import Callable, Dict
 from dotenv import load_dotenv
 
-from src.shoprenter.client import ShoprenterClient
+from src.runner.prefetch import prefetch_all_sources
 
-from src.sync import natura
-# később:
-# from src.sync import masik
+from src.runner.live_runner import (
+    run_master_create_all,
+    run_master_update_all,
+    run_master_all,
+    run_enrich_update_all,
+    run_delete_all,
+)
 
 load_dotenv()
 
-# ==============================================================
-# CLIENT FACTORY
-# ==============================================================
-
-def create_client() -> ShoprenterClient:
-    """
-    Létrehozza a Shoprenter API klienst.
-    Minden supplier ugyanazt a klienst kapja.
-    """
-    return ShoprenterClient(
-        base_url=os.getenv("SHOPRENTER_API_URL"),
-        user=os.getenv("SHOPRENTER_API_USER"),
-        password=os.getenv("SHOPRENTER_API_PASS"),
-    )
-
-# ==============================================================
-# SUPPLIER REGISTRY
-# ==============================================================
-"""
-Itt regisztráljuk az elérhető beszállítókat.
-
-Kulcs:
-    CLI-ből használható név (--supplier)
-
-Érték:
-    A modul, amely tartalmazza:
-        - run_upsert()
-        - run_delete()
-"""
-SUPPLIERS = {
-    "natura": natura,
-    # "masik": masik,
-}
-
-
-# ==============================================================
-# ACTION REGISTRY
-# ==============================================================
-"""
-Itt definiáljuk az elérhető műveleteket (--mode).
-
-Mindegyik action egy függvény,
-amely megkapja a beszállító modult paraméterként.
-"""
-
-
-def run_upsert(supplier, client):
-    """Create + Update futtatása."""
-    supplier.run_upsert(client=client)
-
-
-def run_delete(supplier, client):
-    """Delete futtatása."""
-    supplier.run_delete(client=client)
-
-
-def run_all(supplier, client):
-    """Upsert majd Delete futtatása."""
-    supplier.run_upsert(client=client)
-    supplier.run_delete(client=client)
-
-
-ACTIONS: Dict[str, Callable] = {
-    "upsert": run_upsert,
-    "delete": run_delete,
-    "all": run_all,
-}
-
-
-# ==============================================================
-# MAIN
-# ==============================================================
 
 def main(argv=None) -> int:
-    """
-    CLI argumentum feldolgozás + dispatch.
-
-    Visszatérési kód:
-        0 = siker
-        1 = hiba
-    """
-
-    parser = argparse.ArgumentParser(
-        description="Shop Sync - beszállítói szinkron futtató"
-    )
+    parser = argparse.ArgumentParser(description="Shop Sync (live runner)")
 
     parser.add_argument(
-        "--supplier",
-        required=True,
-        choices=SUPPLIERS.keys(),
-        help="Beszállító neve (pl. natura)",
+        "--master",
+        default=os.getenv("MASTER_SUPPLIER", "natura"),
+        help="Master supplier (default: MASTER_SUPPLIER env)",
     )
 
     parser.add_argument(
         "--mode",
-        default="upsert",
-        choices=ACTIONS.keys(),
-        help="Művelet típusa: upsert | delete | all",
+        required=True,
+        choices=[
+            "prefetch_all",
+            "master_create_all",
+            "master_update_all",
+            "master_all",
+            "enrich_update_all",
+            "delete_all",
+        ],
+        help="Which channel to run",
     )
 
     args = parser.parse_args(argv)
+    master = str(args.master).strip()
 
-    supplier = SUPPLIERS.get(args.supplier)
-    action = ACTIONS.get(args.mode)
+    if args.mode == "master_create_all":
+        run_master_create_all(master_supplier=master)
+    elif args.mode == "master_update_all":
+        run_master_update_all(master_supplier=master)
+    elif args.mode == "enrich_update_all":
+        run_enrich_update_all(master_supplier=master)
+    elif args.mode == "delete_all":
+        run_delete_all(master_supplier=master)
+    elif args.mode == "prefetch_all":
+        prefetch_all_sources(skip={master})
+    elif args.mode == "master_all":
+        run_master_all(master_supplier=master)
 
-    client = create_client()
-
-    try:
-        action(supplier, client)
-        return 0
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 1
+    return 0
 
 
 if __name__ == "__main__":

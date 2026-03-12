@@ -1,0 +1,12 @@
+{
+  "name": "carpzoom",
+  "type": "xml",
+  "source": {
+    "url": "https://www.carpzoomnagyker.hu/api/get/partner_arlista_onallo"
+  },
+  "cache": {
+    "enabled": true,
+    "ttl_seconds": 86400,
+    "dir": "data/cache"
+  }
+}

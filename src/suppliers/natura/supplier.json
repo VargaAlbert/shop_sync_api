@@ -10,7 +10,7 @@
     "has_header": true
   },
   "cache": {
-    "enabled": true,
+    "enabled": false,
     "ttl_seconds": 86400,
     "dir": "data/cache"
   }

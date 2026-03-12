@@ -45,10 +45,15 @@ class HaldepoWholesalePricingPlugin:
             if p.get("wholesale_price") != hw_gross_rounded:
                 p["wholesale_price"] = hw_gross_rounded
                 changed = True
-
+        """
         if changed:
             p["_priced_by"] = "haldepo"
             return p
 
         # volt match, de nem módosított semmit
         return merged
+        """
+        # ha van match, mindig jelöljük forrásként
+        p["_priced_by"] = "haldepo"
+
+        return p
