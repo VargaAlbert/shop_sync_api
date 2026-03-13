@@ -46,6 +46,7 @@ class ShoprenterClient:
             json=payload,
             timeout=self.timeout,
         )
+
         resp.raise_for_status()
         if not resp.text.strip():
             return {}

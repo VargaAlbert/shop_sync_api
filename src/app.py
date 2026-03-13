@@ -1,46 +1,98 @@
 """
 Shop Sync Runner
 ================
-Ez az alkalmazás a beszállítói adatokat feldolgozza és a Shoprenter API-n keresztül
-szinkronizálja a webshop termékeit.
 
-A rendszer 4 külön "csatornát" kezel:
+Ez az alkalmazás a beszállítói adatokat feldolgozza, majd a Shoprenter API-n
+keresztül szinkronizálja a webshop termékeit.
 
-1. MASTER_CREATE_ALL
+A rendszer több külön futtatási módot kezel, amelyek egymástól függetlenül
+is indíthatók.
+
+--------------------------------------------------------------------
+FUTTATÁSI MÓDOK
+--------------------------------------------------------------------
+
+1. PREFETCH_ALL
+   ------------------
+   Előre letölti és cache-eli a nem master beszállítók forrásadatait.
+
+   Célja:
+   - gyorsítani a későbbi enrich futásokat
+   - csökkenteni az élő futás közbeni letöltési időt
+   - előre felépíteni a beszállítói cache állományokat
+
+   FONTOS:
+   A master beszállító itt automatikusan skipelődik, mert azt a master folyamat
+   saját maga kezeli.
+
+   Példa:
+       python -m src.app --mode prefetch_all
+
+2. MASTER_CREATE_ALL
    ------------------
    Új termékeket hoz létre a Shoprenterben a master beszállító alapján.
+
    Csak azokat a SKU-kat hozza létre, amelyek még nem léteznek a Shoprenterben.
 
-2. MASTER_UPDATE_ALL
+   Példa:
+       python -m src.app --mode master_create_all
+
+3. MASTER_UPDATE_ALL
    ------------------
-   A már létező termékek alapadatait frissíti:
+   A már létező termékek alapadatait frissíti.
+
+   Tipikusan ilyen mezők:
    - ár
    - készlet
    - név
    - alap termékadatok
 
-3. ENRICH_UPDATE_ALL
+   Példa:
+       python -m src.app --mode master_update_all
+
+4. MASTER_ALL
    ------------------
-   Kiegészítő adatokat frissít:
+   Kombinált master futás.
+
+   Egymás után végrehajtja:
+   - MASTER_CREATE_ALL
+   - MASTER_UPDATE_ALL
+
+   Akkor hasznos, ha napi szinkronnál egyetlen paranccsal szeretnéd kezelni
+   az új termékek létrehozását és a meglévők frissítését.
+
+   Példa:
+       python -m src.app --mode master_all
+
+5. ENRICH_UPDATE_ALL
+   ------------------
+   Kiegészítő adatokat frissít a termékeken.
+
+   Tipikusan ilyen adatok:
    - leírás
    - képek
-   - egyéb enrich adatok
+   - egyéb enrich mezők
 
-   Csak azokon a termékeken fut le, ahol az enrich pipeline
-   tényleges változást talált.
+   Csak azokon a termékeken fut le, ahol az enrich pipeline tényleges változást
+   talált.
 
-4. DELETE_ALL
+   Példa:
+       python -m src.app --mode enrich_update_all
+
+6. DELETE_ALL
    ------------------
-   Azokat a termékeket törli a Shoprenterből,
-   amelyek már nem szerepelnek a master beszállító listájában.
+   Azokat a termékeket törli a Shoprenterből, amelyek már nem szerepelnek
+   a master beszállító listájában.
 
    FONTOS:
-   A törlés csak akkor történik meg ha a .env fájlban:
+   A törlés csak akkor történik meg, ha a .env fájlban ez engedélyezve van:
 
        DELETE_ENABLED=1
 
-   Ha ez nincs beállítva, a törlés automatikusan skipelődik
-   biztonsági okból.
+   Ha ez nincs beállítva, a törlés automatikusan skipelődik biztonsági okból.
+
+   Példa:
+       python -m src.app --mode delete_all
 
 --------------------------------------------------------------------
 PARANCS SOROS FUTTATÁS
@@ -48,10 +100,16 @@ PARANCS SOROS FUTTATÁS
 
 A program a projekt gyökérkönyvtárából futtatható.
 
-Windows / Linux / Mac:
+Általános forma:
 
+    python -m src.app --mode <futtatasi_mod>
+
+Példák:
+
+    python -m src.app --mode prefetch_all
     python -m src.app --mode master_create_all
     python -m src.app --mode master_update_all
+    python -m src.app --mode master_all
     python -m src.app --mode enrich_update_all
     python -m src.app --mode delete_all
 
@@ -59,84 +117,136 @@ Windows / Linux / Mac:
 MASTER SUPPLIER MEGADÁSA
 --------------------------------------------------------------------
 
-Alapértelmezett master beszállító a .env fájlban:
+Az alapértelmezett master beszállító a .env fájlban állítható be:
 
     MASTER_SUPPLIER=natura
 
-De parancssorban felülírható:
+Ez parancssorból felülírható:
 
     python -m src.app --mode master_update_all --master natura
 
+A --master paraméter az alábbi módoknál releváns:
+- master_create_all
+- master_update_all
+- master_all
+- enrich_update_all
+- delete_all
+- prefetch_all esetén a megadott master automatikusan skipelődik
+
 --------------------------------------------------------------------
-TESZTELÉSI SORREND (AJÁNLOTT)
+AJÁNLOTT TESZTELÉSI SORREND
 --------------------------------------------------------------------
-1 Új termékek létrehozása
+
+Fejlesztés vagy első élesítés előtt ajánlott sorrend:
+
+1. Források előtöltése
+
+    python -m src.app --mode prefetch_all
+
+2. Új termékek létrehozása
 
     python -m src.app --mode master_create_all
 
-2 Termékek frissítése
+3. Meglévő termékek alapfrissítése
 
     python -m src.app --mode master_update_all
 
-3 Enrich adatok frissítése (képek, leírás)
+4. Enrich adatok frissítése
 
     python -m src.app --mode enrich_update_all
 
-4 Törlés tesztelése
+5. Törlés tesztelése külön, fokozott óvatossággal
 
     python -m src.app --mode delete_all
 
 --------------------------------------------------------------------
 AJÁNLOTT NAPI ÜTEMEZÉS
 --------------------------------------------------------------------
-MASTER_CREATE + MASTER_UPDATE
 
-    07:00
-    11:00
-    15:00
+1. PREFETCH_ALL
+   Nem kötelező minden futás előtt, de hasznos lehet:
+
+    02:00
+
+2. MASTER_ALL
+   A legtöbb napi szinkronhoz ez a legpraktikusabb:
+
+    10:00
+    14:00
     18:00
     00:00
 
-ENRICH_UPDATE
+3. ENRICH_UPDATE_ALL
 
     03:00
 
-DELETE_ALL
+4. DELETE_ALL
 
     06:00
+
+Megjegyzés:
+Ha nem a kombinált futást használod, akkor a MASTER_CREATE_ALL és
+MASTER_UPDATE_ALL külön is ütemezhető.
 
 --------------------------------------------------------------------
 LOGOK
 --------------------------------------------------------------------
+
 A rendszer automatikusan logol ide:
 
     data/logs/shop_sync.log
 
-A log tartalmazza:
-
-    - futási idő
-    - feldolgozott termékek száma
-    - hibák
-    - API válaszok
+A log tipikusan tartalmazza:
+- futási idő
+- feldolgozott termékek száma
+- hibák
+- API válaszok
+- skip események
+- létrehozott / frissített / törölt elemek száma
 
 --------------------------------------------------------------------
-PÉLDA TELJES TESZT FUTTATÁS
+PÉLDA TELJES FEJLESZTŐI FUTTATÁS
 --------------------------------------------------------------------
 
-Fejlesztés közben érdemes így végigfuttatni:
+Fejlesztés közben tipikus teljes futtatás:
+
+    python -m src.app --mode prefetch_all
+    python -m src.app --mode master_all
+    python -m src.app --mode enrich_update_all
+
+Vagy külön bontva:
 
     python -m src.app --mode master_create_all
     python -m src.app --mode master_update_all
     python -m src.app --mode enrich_update_all
 
 --------------------------------------------------------------------
-FONTOS
+BIZTONSÁGI MEGJEGYZÉS
 --------------------------------------------------------------------
-A delete művelet csak akkor fut le ha:
+
+A delete művelet csak akkor fut le, ha:
 
     DELETE_ENABLED=1
 
-Ez védi a webshopot véletlen tömeges törlés ellen.
+Ez védi a webshopot a véletlen tömeges törlés ellen.
+
+Éles környezetben ajánlott:
+- a delete futást külön időzíteni
+- a logokat rendszeresen ellenőrizni
+- a törlési logikát először kis mintán tesztelni
+
+--------------------------------------------------------------------
+ÖSSZEFOGLALÁS
+--------------------------------------------------------------------
+
+A legfontosabb módok:
+
+- prefetch_all       -> nem master források előtöltése
+- master_create_all  -> új termékek létrehozása
+- master_update_all  -> meglévő termékek frissítése
+- master_all         -> create + update együtt
+- enrich_update_all  -> leírások, képek, enrich mezők frissítése
+- delete_all         -> hiányzó termékek törlése, csak engedélyezve
 
 """
 # src/app.py
@@ -147,7 +257,6 @@ import os
 from dotenv import load_dotenv
 
 from src.runner.prefetch import prefetch_all_sources
-
 from src.runner.live_runner import (
     run_master_create_all,
     run_master_update_all,
@@ -160,7 +269,9 @@ load_dotenv()
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Shop Sync (live runner)")
+    parser = argparse.ArgumentParser(
+        description="Shop Sync runner for Shoprenter product synchronization"
+    )
 
     parser.add_argument(
         "--master",

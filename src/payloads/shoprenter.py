@@ -11,9 +11,10 @@ Publikus API:
 Fő elvek:
 - MASTER_CREATE: teljes create payload
 - MASTER_UPDATE: csak alap mezők, productDescriptions NINCS
-- ENRICH_UPDATE: csak akkor épül, ha van tényleges leírás
-- ENRICH_UPDATE productDescriptions már Shoprenter-kompatibilis:
-    product + language + name + description
+- ENRICH_UPDATE: leírás / kép / nagyker ár frissítés
+- A Shoprenter a price mezőt nettóként kezeli
+- A vevőcsoport árakhoz a helyes inline mező:
+    customerGroupProductPrices
 """
 
 from typing import Any, Dict, Mapping, Optional, Set, Literal, Callable, TypedDict
@@ -27,9 +28,6 @@ from src.utils.images import build_shop_image_path, image_alt_from_model
 # ---------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------
-# FONTOS:
-# Ez legyen a shopban ténylegesen létező language resource ID.
-# Ha nem jó, ENRICH_UPDATE-nél 40007 hibát kapsz.
 DEFAULT_LANGUAGE_ID = os.getenv(
     "SHOPRENTER_LANGUAGE_ID",
     "bGFuZ3VhZ2UtbGFuZ3VhZ2VfaWQ9MQ==",
@@ -40,7 +38,17 @@ DEFAULT_CATEGORY_ID = os.getenv(
     "Y2F0ZWdvcnktY2F0ZWdvcnlfaWQ9MjM4",
 )
 
-WHOLESALE_GROUP_NAME_DEFAULT = os.getenv("WHOLESALE_GROUP_NAME", "NAGYKER")
+# 27%-os ÁFA tax class
+DEFAULT_TAX_CLASS_ID = os.getenv(
+    "SHOPRENTER_TAX_CLASS_ID",
+    "dGF4Q2xhc3MtdGF4X2NsYXNzX2lkPTEw",
+)
+
+# NAGYKER customer group id
+WHOLESALE_CUSTOMER_GROUP_ID = os.getenv(
+    "SHOPRENTER_WHOLESALE_GROUP_ID",
+    "Y3VzdG9tZXJHcm91cC1jdXN0b21lcl9ncm91cF9pZD0xMA==",
+)
 
 
 PayloadMode = Literal[
@@ -67,33 +75,34 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "modelNumber",
         "gtin",
         "price",
+        "taxClass",
         "status",
         "stock1",
         "productDescriptions",
         "productCategoryRelations",
         "mainPicture",
         "imageAlt",
-        "_post_actions",
+        "customerGroupProductPrices",
     },
     "MASTER_UPDATE": {
         "sku",
         "modelNumber",
         "gtin",
         "price",
-        "_post_actions",
+        "taxClass",
+        "customerGroupProductPrices",
     },
     "ENRICH_UPDATE": {
         "sku",
         "productDescriptions",
         "mainPicture",
         "imageAlt",
-        "_post_actions",
+        "customerGroupProductPrices",
     },
     "WHOLESALE_PRICE_UPDATE": {
         "sku",
         "modelNumber",
-        "price",
-        "_post_actions",
+        "customerGroupProductPrices",
     },
 }
 
@@ -144,6 +153,7 @@ def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
             return v
     return None
 
+
 def _pick_prepared_shoprenter_main_image(p: Dict[str, Any]) -> Optional[str]:
     """
     Előnyben részesítjük azt a képet, amit a live_runner már feltöltött
@@ -159,6 +169,7 @@ def _pick_prepared_shoprenter_main_image(p: Dict[str, Any]) -> Optional[str]:
             return v
     return None
 
+
 def load_category_map_for_supplier(supplier_name: str) -> Optional[Dict[str, str]]:
     p = Path("config") / "suppliers" / supplier_name / "category_map.json"
     if not p.exists():
@@ -167,6 +178,31 @@ def load_category_map_for_supplier(supplier_name: str) -> Optional[Dict[str, str
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _gross_to_net_27(gross: float) -> float:
+    return float(gross) / 1.27
+
+
+def _tax_class_ref() -> Dict[str, str]:
+    return {"id": DEFAULT_TAX_CLASS_ID}
+
+
+def _customer_group_product_prices(p: Dict[str, Any]) -> list[dict]:
+    wholesale = p.get("wholesale_price")
+    if wholesale is None:
+        return []
+
+    net_price = _gross_to_net_27(float(wholesale))
+
+    return [
+        {
+            "price": _fmt_price(net_price),
+            "customerGroup": {
+                "id": WHOLESALE_CUSTOMER_GROUP_ID,
+            },
+        }
+    ]
 
 
 def _resolve_category_id(
@@ -192,30 +228,12 @@ def _resolve_category_id(
     return DEFAULT_CATEGORY_ID
 
 
-def _wholesale_post_actions(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    wholesale = p.get("wholesale_price")
-    if wholesale is None:
-        return None
-
-    return {
-        "customer_group_prices": [
-            {
-                "customer_group_name": WHOLESALE_GROUP_NAME_DEFAULT,
-                "price": _fmt_price(float(wholesale)),
-            }
-        ]
-    }
-
-
 def _build_product_descriptions_for_create_or_update(
     *,
     language_id: str,
     name_hu: str,
     desc_hu: str,
 ) -> list[Dict[str, Any]]:
-    """
-    CREATE esetén a régi egyszerű struktúra maradhat.
-    """
     item: Dict[str, Any] = {
         "language_id": language_id,
         "name": name_hu,
@@ -232,10 +250,6 @@ def _build_product_descriptions_for_enrich(
     name_hu: str,
     desc_hu: str,
 ) -> list[Dict[str, Any]]:
-    """
-    ENRICH_UPDATE esetén a Shoprenter productDescriptions elemhez
-    product + language kapcsolat is kell.
-    """
     item: Dict[str, Any] = {
         "product": {"id": product_id},
         "language": {"id": language_id},
@@ -243,6 +257,7 @@ def _build_product_descriptions_for_enrich(
         "description": desc_hu,
     }
     return [item]
+
 
 # ---------------------------------------------------------------------
 # Mode-specifikus builder-ek
@@ -269,7 +284,9 @@ def build_master_create_payload(
     desc_hu = _pick_desc_hu(p)
     cat_id = _resolve_category_id(p, category_id=category_id, category_map=category_map)
 
-    main_img = _pick_main_image(p)
+    main_img = _pick_prepared_shoprenter_main_image(p)
+    if not main_img:
+        main_img = _pick_main_image(p)
 
     if not main_img:
         csoport1 = str(p.get("csoport1_name") or "").strip()
@@ -281,7 +298,8 @@ def build_master_create_payload(
         "sku": sku,
         "modelNumber": model,
         "gtin": gtin,
-        "price": _fmt_price(float(gross)),
+        "price": _fmt_price(_gross_to_net_27(float(gross))),
+        "taxClass": _tax_class_ref(),
         "status": int(status_value),
         "stock1": int(stock1),
         "productDescriptions": _build_product_descriptions_for_create_or_update(
@@ -292,6 +310,7 @@ def build_master_create_payload(
         "productCategoryRelations": [{"category_id": cat_id}],
         "mainPicture": main_img,
         "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
+        "customerGroupProductPrices": _customer_group_product_prices(p),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_CREATE"])
@@ -302,10 +321,6 @@ def build_master_update_payload(
     *,
     language_id: str,
 ) -> Dict[str, Any]:
-    """
-    MASTER_UPDATE = csak alap mezők.
-    NINCS productDescriptions.
-    """
     sku = _require_str(p, "sku", ctx="master_update")
 
     gross = p.get("gross_price")
@@ -319,7 +334,9 @@ def build_master_update_payload(
         "sku": sku,
         "modelNumber": model,
         "gtin": gtin,
-        "price": _fmt_price(float(gross)),
+        "price": _fmt_price(_gross_to_net_27(float(gross))),
+        "taxClass": _tax_class_ref(),
+        "customerGroupProductPrices": _customer_group_product_prices(p),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
@@ -331,22 +348,9 @@ def build_enrich_update_payload(
     language_id: str,
     product_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    ENRICH_UPDATE:
-    - csak akkor ad payloadot, ha van tényleges leírás
-    - productDescriptions Shoprenter-kompatibilis formában épül
-    - product_id nélkül nem építünk leírás payloadot
-    - ha a runner már feltöltötte a képet, azt használjuk mainPicture-ként
-    """
     sku = _require_str(p, "sku", ctx="enrich_update")
 
     desc_hu = _pick_desc_hu(p)
-    if not desc_hu:
-        return {}
-
-    if not product_id:
-        raise ValueError(f"Missing product_id (enrich_update sku={sku})")
-
     name_hu = _pick_name_hu(p)
     model = str(p.get("model") or "").strip() or sku
 
@@ -354,41 +358,52 @@ def build_enrich_update_payload(
     if not main_img:
         main_img = _pick_main_image(p)
 
+    customer_group_prices = _customer_group_product_prices(p)
+
+    has_description_part = bool(desc_hu)
+    has_image_part = bool(main_img)
+    has_wholesale_part = bool(customer_group_prices)
+
+    if not (has_description_part or has_image_part or has_wholesale_part):
+        return {}
+
     payload: Dict[str, Any] = {
         "sku": sku,
-        "productDescriptions": _build_product_descriptions_for_enrich(
+        "mainPicture": main_img,
+        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
+        "customerGroupProductPrices": customer_group_prices,
+    }
+
+    if has_description_part:
+        if not product_id:
+            raise ValueError(f"Missing product_id (enrich_update sku={sku})")
+
+        payload["productDescriptions"] = _build_product_descriptions_for_enrich(
             product_id=product_id,
             language_id=language_id,
             name_hu=name_hu,
             desc_hu=desc_hu,
-        ),
-        "mainPicture": main_img,
-        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
-    }
+        )
 
     return filter_payload(payload, PAYLOAD_FIELDS["ENRICH_UPDATE"])
 
+
 def build_wholesale_price_update_payload(p: Dict[str, Any]) -> Dict[str, Any]:
     sku = _require_str(p, "sku", ctx="wholesale_price_update")
-
-    gross = p.get("gross_price")
-    if gross is None:
-        raise ValueError(f"Missing gross_price (wholesale_price_update sku={sku})")
-
     model = str(p.get("model") or "").strip() or sku
 
-    post_actions = _wholesale_post_actions(p)
-    if not post_actions:
+    customer_group_prices = _customer_group_product_prices(p)
+    if not customer_group_prices:
         raise ValueError(f"Missing wholesale_price (wholesale_price_update sku={sku})")
 
     payload: Dict[str, Any] = {
         "sku": sku,
         "modelNumber": model,
-        "price": _fmt_price(float(gross)),
-        "_post_actions": post_actions,
+        "customerGroupProductPrices": customer_group_prices,
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["WHOLESALE_PRICE_UPDATE"])
+
 
 # ---------------------------------------------------------------------
 # build_payload registry

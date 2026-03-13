@@ -174,6 +174,19 @@ def _upload_file_with_retry(
 
     return {}
 
+def _materialize_post_actions(payload: dict) -> dict:
+    """
+    A builder-ek belső `_post_actions` mezőjét átemeli
+    valódi Shoprenter payload mezőkre.
+    """
+    out = dict(payload or {})
+    post_actions = out.pop("_post_actions", None) or {}
+
+    customer_group_prices = post_actions.get("customer_group_prices")
+    if customer_group_prices:
+        out["customer_group_prices"] = customer_group_prices
+
+    return out
 
 def _save_failed_payload(prefix: str, sku: str, payload: dict) -> None:
     fail_dir = Path("data/debug/failed_payloads")
@@ -240,7 +253,7 @@ def _resolve_enrich_main_picture(
 
         p["shoprenter_main_picture"] = prepared["file_path"]
 
-        log.info(
+        log.debug(
             "ENRICH image uploaded sku=%s supplier=%s path=%s",
             sku,
             supplier_name,
@@ -299,7 +312,8 @@ def run_master_create_all(*, master_supplier: str) -> RunStats:
                 language_id=DEFAULT_LANGUAGE_ID,
             )
 
-            resp = client.create_product(payload)
+            api_payload = _materialize_post_actions(payload)
+            resp = client.create_product(api_payload)
             new_id = resp.get("id")
             if new_id:
                 sku_map[sku] = str(new_id)
@@ -383,10 +397,16 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
                 skipped += 1
                 continue
 
+            api_payload = _materialize_post_actions(payload)
+
+            if sku == "50":
+                print("DEBUG MASTER_ALL PAYLOAD:")
+                print(api_payload)
+
             _update_with_retry(
                 client,
                 pid,
-                payload,
+                api_payload,
                 max_retries=int(os.getenv("SHOPRENTER_RETRY_MAX", "6")),
                 base_sleep=float(os.getenv("SHOPRENTER_RETRY_BASE_SLEEP", "1.5")),
                 per_request_sleep=float(os.getenv("SHOPRENTER_REQUEST_SLEEP", "0.40")),
@@ -481,6 +501,8 @@ def run_enrich_update_all(*, master_supplier: str) -> RunStats:
             if not payload:
                 skipped += 1
                 continue
+
+            api_payload = _materialize_post_actions(payload)
 
             _update_with_retry(
                 client,
@@ -634,8 +656,10 @@ def run_master_all(*, master_supplier: str) -> RunStats:
                     skipped += 1
                     continue
 
-                resp = client.create_product(payload)
+                api_payload = _materialize_post_actions(payload)
+                resp = client.create_product(api_payload)
                 new_id = resp.get("id")
+                
                 if new_id:
                     sku_map[sku] = str(new_id)
 
@@ -653,10 +677,12 @@ def run_master_all(*, master_supplier: str) -> RunStats:
                 skipped += 1
                 continue
 
+            api_payload = _materialize_post_actions(payload)
+
             _update_with_retry(
                 client,
                 pid,
-                payload,
+                api_payload,
                 max_retries=int(os.getenv("SHOPRENTER_RETRY_MAX", "6")),
                 base_sleep=float(os.getenv("SHOPRENTER_RETRY_BASE_SLEEP", "1.5")),
                 per_request_sleep=float(os.getenv("SHOPRENTER_REQUEST_SLEEP", "0.40")),
