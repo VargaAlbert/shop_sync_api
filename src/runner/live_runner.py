@@ -10,11 +10,14 @@ from typing import Optional, Set
 import requests
 from dotenv import load_dotenv
 
+from src.shoprenter.lookups import build_product_sku_map, build_manufacturer_name_map
 from src.core.pipeline import run_pipeline
 from src.payloads.shoprenter import build_payload, DEFAULT_LANGUAGE_ID
 from src.shoprenter.client import ShoprenterClient
-from src.shoprenter.lookups import build_product_sku_map
-from src.utils.images import prepare_shoprenter_image_upload
+from src.utils.images import (
+    prepare_shoprenter_image_upload,
+    build_main_picture_path_for_product,
+)
 from src.utils.log import setup_logging
 
 load_dotenv()
@@ -207,9 +210,8 @@ def _resolve_enrich_main_picture(
     log,
 ) -> dict:
     """
-    Ha van külső enrich kép URL, megpróbálja feltölteni Shoprenterbe.
-    Ha a kép letöltése/feltöltése nem sikerül, attól még az enrich update
-    tovább mehet leírással, csak kép nélkül.
+    ENRICH képet egységes célpathra tölt fel:
+    product/<CSOPORT1-folder>/<model>.jpg
     """
     p = dict(product)
 
@@ -221,25 +223,29 @@ def _resolve_enrich_main_picture(
     if not image_url:
         return p
 
-    if image_url.startswith("product/"):
-        p["shoprenter_main_picture"] = image_url
-        return p
-
-    supplier_name = str(
-        p.get("_enriched_by")
-        or p.get("supplier")
-        or ""
-    ).strip().lower() or "supplier"
-
     sku = str(p.get("sku") or "").strip() or None
     model = str(p.get("model") or "").strip() or sku
 
+    target_file_path = build_main_picture_path_for_product(
+        p,
+        model=model,
+        slot=1,
+        ext=".jpg",
+    )
+    if not target_file_path:
+        return p
+
+    # Ha már belső path, akkor is az egységes célpathot írjuk be
+    if image_url.startswith("product/"):
+        p["shoprenter_main_picture"] = target_file_path
+        return p
+
     try:
         prepared = prepare_shoprenter_image_upload(
-            supplier_name=supplier_name,
             image_url=image_url,
             sku=sku,
             model=model,
+            file_path=target_file_path,
         )
 
         _upload_file_with_retry(
@@ -251,25 +257,73 @@ def _resolve_enrich_main_picture(
             per_request_sleep=float(os.getenv("SHOPRENTER_REQUEST_SLEEP", "0.60")),
         )
 
-        p["shoprenter_main_picture"] = prepared["file_path"]
+        p["shoprenter_main_picture"] = target_file_path
 
         log.debug(
-            "ENRICH image uploaded sku=%s supplier=%s path=%s",
+            "ENRICH image uploaded sku=%s path=%s",
             sku,
-            supplier_name,
-            prepared["file_path"],
+            target_file_path,
         )
 
     except Exception as e:
         log.warning(
-            "ENRICH image skipped sku=%s supplier=%s url=%s error=%s",
+            "ENRICH image skipped sku=%s url=%s target=%s error=%s",
             sku,
-            supplier_name,
             image_url,
+            target_file_path,
             e,
         )
 
     return p
+
+def _norm_manufacturer_name(value: str) -> str:
+    import unicodedata
+
+    s = str(value or "").strip().lower()
+    if not s:
+        return ""
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return " ".join(s.split())
+
+
+def _resolve_manufacturer_for_payload(
+    product: dict,
+    manufacturer_map: dict[str, str],
+) -> dict:
+    p = dict(product)
+
+    name = str(p.get("manufacturer_name") or "").strip()
+    if not name:
+        raw = p.get("raw")
+        if isinstance(raw, dict):
+            name = str(raw.get("CSOPORT3") or "").strip()
+
+    if not name:
+        return p
+
+    key = _norm_manufacturer_name(name)
+    mid = manufacturer_map.get(key)
+    if mid:
+        p["_resolved_manufacturer_id"] = mid
+
+    return p
+
+def _extract_created_manufacturer_id_and_name(resp: dict) -> tuple[str, str]:
+    m = resp.get("manufacturer")
+    if not isinstance(m, dict):
+        return "", ""
+
+    mid = str(m.get("id") or "").strip()
+    name = str(m.get("name") or "").strip()
+
+    if not name:
+        md = m.get("manufacturerDescription")
+        if isinstance(md, dict):
+            name = str(md.get("name") or "").strip()
+
+    return mid, name
 
 def run_master_create_all(*, master_supplier: str) -> RunStats:
     log = setup_logging()
@@ -280,6 +334,13 @@ def run_master_create_all(*, master_supplier: str) -> RunStats:
         client,
         limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
     )
+
+    log.info("Manufacturer map building...")
+    manufacturer_map = build_manufacturer_name_map(
+        client,
+        limit=int(os.getenv("SHOPRENTER_MANUFACTURER_MAP_LIMIT", "200")),
+    )
+    log.info("Manufacturer map loaded: %s", len(manufacturer_map))
 
     log.info("Pipeline running (master=%s)...", master_supplier)
     res = run_pipeline(
@@ -305,15 +366,23 @@ def run_master_create_all(*, master_supplier: str) -> RunStats:
             skipped += 1
             continue
 
-        try:
-            payload = build_payload(
-                "MASTER_CREATE",
-                dict(p),
-                language_id=DEFAULT_LANGUAGE_ID,
-            )
+        prepared_product = _resolve_manufacturer_for_payload(
+            dict(p),
+            manufacturer_map,
+        )
 
+        payload = build_payload(
+            "MASTER_CREATE",
+            prepared_product,
+            language_id=DEFAULT_LANGUAGE_ID,
+        )
+
+        try:
             api_payload = _materialize_post_actions(payload)
             resp = client.create_product(api_payload)
+            created_mid, created_mname = _extract_created_manufacturer_id_and_name(resp)
+            if created_mid and created_mname:
+                manufacturer_map[_norm_manufacturer_name(created_mname)] = created_mid
             new_id = resp.get("id")
             if new_id:
                 sku_map[sku] = str(new_id)
@@ -361,6 +430,13 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
         limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
     )
 
+    log.info("Manufacturer map building...")
+    manufacturer_map = build_manufacturer_name_map(
+        client,
+        limit=int(os.getenv("SHOPRENTER_MANUFACTURER_MAP_LIMIT", "200")),
+    )
+    log.info("Manufacturer map loaded: %s", len(manufacturer_map))
+
     log.info("Pipeline running (master=%s)...", master_supplier)
     res = run_pipeline(
         master_supplier=master_supplier,
@@ -386,10 +462,15 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
             skipped += 1
             continue
 
+        prepared_product = _resolve_manufacturer_for_payload(
+            dict(p),
+            manufacturer_map,
+        )
+
         try:
             payload = build_payload(
                 "MASTER_UPDATE",
-                dict(p),
+                prepared_product,
                 language_id=DEFAULT_LANGUAGE_ID,
             )
 
@@ -398,10 +479,6 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
                 continue
 
             api_payload = _materialize_post_actions(payload)
-
-            if sku == "50":
-                print("DEBUG MASTER_ALL PAYLOAD:")
-                print(api_payload)
 
             _update_with_retry(
                 client,
@@ -507,7 +584,7 @@ def run_enrich_update_all(*, master_supplier: str) -> RunStats:
             _update_with_retry(
                 client,
                 pid,
-                payload,
+                api_payload,
                 max_retries=int(os.getenv("SHOPRENTER_RETRY_MAX", "6")),
                 base_sleep=float(os.getenv("SHOPRENTER_RETRY_BASE_SLEEP", "1.5")),
                 per_request_sleep=float(os.getenv("SHOPRENTER_REQUEST_SLEEP", "0.60")),
@@ -606,13 +683,6 @@ def run_delete_all(*, master_supplier: str) -> RunStats:
 
 
 def run_master_all(*, master_supplier: str) -> RunStats:
-    """
-    Egy futásban:
-    1) MASTER_CREATE: ami nincs fent Shoprenterben -> létrehozza
-    2) MASTER_UPDATE: ami fent van -> frissíti
-
-    FONTOS: a pipeline csak egyszer fut le!
-    """
     log = setup_logging()
     client = _create_client()
 
@@ -621,6 +691,13 @@ def run_master_all(*, master_supplier: str) -> RunStats:
         client,
         limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
     )
+
+    log.info("Manufacturer map building...")
+    manufacturer_map = build_manufacturer_name_map(
+        client,
+        limit=int(os.getenv("SHOPRENTER_MANUFACTURER_MAP_LIMIT", "200")),
+    )
+    log.info("Manufacturer map loaded: %s", len(manufacturer_map))
 
     log.info("Pipeline running (master=%s)...", master_supplier)
     res = run_pipeline(
@@ -644,11 +721,16 @@ def run_master_all(*, master_supplier: str) -> RunStats:
 
         pid = sku_map.get(sku)
 
+        prepared_product = _resolve_manufacturer_for_payload(
+            dict(p),
+            manufacturer_map,
+        )
+
         try:
             if not pid:
                 payload = build_payload(
                     "MASTER_CREATE",
-                    dict(p),
+                    prepared_product,
                     language_id=DEFAULT_LANGUAGE_ID,
                 )
 
@@ -658,8 +740,12 @@ def run_master_all(*, master_supplier: str) -> RunStats:
 
                 api_payload = _materialize_post_actions(payload)
                 resp = client.create_product(api_payload)
+
+                created_mid, created_mname = _extract_created_manufacturer_id_and_name(resp)
+                if created_mid and created_mname:
+                    manufacturer_map[_norm_manufacturer_name(created_mname)] = created_mid
+
                 new_id = resp.get("id")
-                
                 if new_id:
                     sku_map[sku] = str(new_id)
 
@@ -669,7 +755,7 @@ def run_master_all(*, master_supplier: str) -> RunStats:
 
             payload = build_payload(
                 "MASTER_UPDATE",
-                dict(p),
+                prepared_product,
                 language_id=DEFAULT_LANGUAGE_ID,
             )
 

@@ -22,8 +22,7 @@ import json
 from pathlib import Path
 import os
 
-from src.utils.images import build_shop_image_path, image_alt_from_model
-
+from src.utils.images import build_main_picture_path_for_product, image_alt_from_model
 
 # ---------------------------------------------------------------------
 # Defaults
@@ -49,7 +48,6 @@ WHOLESALE_CUSTOMER_GROUP_ID = os.getenv(
     "SHOPRENTER_WHOLESALE_GROUP_ID",
     "Y3VzdG9tZXJHcm91cC1jdXN0b21lcl9ncm91cF9pZD0xMA==",
 )
-
 
 PayloadMode = Literal[
     "MASTER_CREATE",
@@ -83,6 +81,8 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "mainPicture",
         "imageAlt",
         "customerGroupProductPrices",
+        "noStockStatus",
+        "manufacturer",
     },
     "MASTER_UPDATE": {
         "sku",
@@ -90,7 +90,10 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "gtin",
         "price",
         "taxClass",
+        "mainPicture",
+        "imageAlt",
         "customerGroupProductPrices",
+        "manufacturer",
     },
     "ENRICH_UPDATE": {
         "sku",
@@ -140,6 +143,8 @@ def _pick_desc_hu(p: Dict[str, Any]) -> str:
             return v
     return ""
 
+def _default_main_picture_from_product(p: Dict[str, Any], *, model: str) -> Optional[str]:
+    return build_main_picture_path_for_product(p, model=model) or None
 
 def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
     urls = p.get("image_urls")
@@ -153,6 +158,45 @@ def _pick_main_image(p: Dict[str, Any]) -> Optional[str]:
             return v
     return None
 
+def _no_stock_status_ref_for_create() -> Optional[dict]:
+    stock_status_id = (os.getenv("SHOPRENTER_CREATE_NO_STOCK_STATUS_ID") or "").strip()
+    if not stock_status_id:
+        return None
+    return {"id": stock_status_id}
+
+def _pick_manufacturer_name(p: Dict[str, Any]) -> str:
+    for k in ("manufacturer_name", "manufacturer", "brand"):
+        v = str(p.get(k) or "").strip()
+        if v:
+            return v
+
+    raw = p.get("raw")
+    if isinstance(raw, dict):
+        for k in ("CSOPORT3", "manufacturer_name", "brand"):
+            v = str(raw.get(k) or "").strip()
+            if v:
+                return v
+
+    return ""
+
+
+def _manufacturer_ref(
+    p: Dict[str, Any],
+    *,
+    allow_name_fallback: bool = True,
+) -> Optional[dict]:
+    resolved_id = str(p.get("_resolved_manufacturer_id") or "").strip()
+    if resolved_id:
+        return {"id": resolved_id}
+
+    if not allow_name_fallback:
+        return None
+
+    name = _pick_manufacturer_name(p)
+    if name:
+        return {"name": name}
+
+    return None
 
 def _pick_prepared_shoprenter_main_image(p: Dict[str, Any]) -> Optional[str]:
     """
@@ -179,14 +223,11 @@ def load_category_map_for_supplier(supplier_name: str) -> Optional[Dict[str, str
     except Exception:
         return None
 
-
 def _gross_to_net_27(gross: float) -> float:
     return float(gross) / 1.27
 
-
 def _tax_class_ref() -> Dict[str, str]:
     return {"id": DEFAULT_TAX_CLASS_ID}
-
 
 def _customer_group_product_prices(p: Dict[str, Any]) -> list[dict]:
     wholesale = p.get("wholesale_price")
@@ -215,7 +256,7 @@ def _resolve_category_id(
         return category_id
 
     if category_map:
-        for k in ("category", "category_name", "group1", "CSOPORT1", "csoport1_name"):
+        for k in ("category", "category_name", "group1", "CSOPORT1"):
             name = str(p.get(k) or "").strip()
             if name and name in category_map:
                 return category_map[name]
@@ -235,8 +276,10 @@ def _build_product_descriptions_for_create_or_update(
     desc_hu: str,
 ) -> list[Dict[str, Any]]:
     item: Dict[str, Any] = {
-        "language_id": language_id,
         "name": name_hu,
+        "language": {
+            "id": language_id,
+        },
     }
     if desc_hu:
         item["description"] = desc_hu
@@ -258,6 +301,8 @@ def _build_product_descriptions_for_enrich(
     }
     return [item]
 
+def _default_image_alt_from_product(p: Dict[str, Any], *, name_hu: str, model: str) -> str:
+    return image_alt_from_model(name_hu, model)
 
 # ---------------------------------------------------------------------
 # Mode-specifikus builder-ek
@@ -284,15 +329,13 @@ def build_master_create_payload(
     desc_hu = _pick_desc_hu(p)
     cat_id = _resolve_category_id(p, category_id=category_id, category_map=category_map)
 
-    main_img = _pick_prepared_shoprenter_main_image(p)
-    if not main_img:
-        main_img = _pick_main_image(p)
+    main_img = _default_main_picture_from_product(p, model=model)
 
-    if not main_img:
-        csoport1 = str(p.get("csoport1_name") or "").strip()
-        generated = build_shop_image_path(csoport1, model, slot=1, ext=".jpg")
-        if generated:
-            main_img = generated
+    image_alt = _default_image_alt_from_product(
+        p,
+        name_hu=name_hu,
+        model=model,
+    )
 
     payload: Dict[str, Any] = {
         "sku": sku,
@@ -307,10 +350,18 @@ def build_master_create_payload(
             name_hu=name_hu,
             desc_hu=desc_hu,
         ),
-        "productCategoryRelations": [{"category_id": cat_id}],
+        "productCategoryRelations": [
+            {
+                "category": {
+                    "id": cat_id,
+                }
+            }
+        ],
         "mainPicture": main_img,
-        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
+        "imageAlt": image_alt,
         "customerGroupProductPrices": _customer_group_product_prices(p),
+        "noStockStatus": _no_stock_status_ref_for_create(),
+        "manufacturer": _manufacturer_ref(p, allow_name_fallback=True),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_CREATE"])
@@ -330,13 +381,26 @@ def build_master_update_payload(
     model = str(p.get("model") or "").strip() or sku
     gtin = str(p.get("gtin") or p.get("ean") or "").strip() or None
 
+    name_hu = _pick_name_hu(p)
+
+    main_img = _default_main_picture_from_product(p, model=model)
+
+    image_alt = _default_image_alt_from_product(
+        p,
+        name_hu=name_hu,
+        model=model,
+    )
+
     payload: Dict[str, Any] = {
         "sku": sku,
         "modelNumber": model,
         "gtin": gtin,
         "price": _fmt_price(_gross_to_net_27(float(gross))),
         "taxClass": _tax_class_ref(),
+        "mainPicture": main_img,
+        "imageAlt": image_alt,
         "customerGroupProductPrices": _customer_group_product_prices(p),
+        "manufacturer": _manufacturer_ref(p, allow_name_fallback=False),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
@@ -354,9 +418,13 @@ def build_enrich_update_payload(
     name_hu = _pick_name_hu(p)
     model = str(p.get("model") or "").strip() or sku
 
-    main_img = _pick_prepared_shoprenter_main_image(p)
-    if not main_img:
-        main_img = _pick_main_image(p)
+    main_img = _default_main_picture_from_product(p, model=model)
+
+    image_alt = _default_image_alt_from_product(
+        p,
+        name_hu=name_hu,
+        model=model,
+    )
 
     customer_group_prices = _customer_group_product_prices(p)
 
@@ -370,7 +438,7 @@ def build_enrich_update_payload(
     payload: Dict[str, Any] = {
         "sku": sku,
         "mainPicture": main_img,
-        "imageAlt": image_alt_from_model(name_hu, model) if main_img else None,
+        "imageAlt": image_alt,
         "customerGroupProductPrices": customer_group_prices,
     }
 

@@ -7,26 +7,19 @@ import os
 import re
 import unicodedata
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 from urllib.parse import urlparse, unquote
 
 from src.core.io.http import download_bytes
 
 
 def norm_text(s: str) -> str:
-    """Alap normalizálás: whitespace trim + belső space-ek összevonása."""
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
 
 def clean_sku(value: str) -> str:
-    """
-    SKU / model fájlnévhez:
-    - trim
-    - space -> -
-    - csak biztonságos karakterek: A-Z a-z 0-9 _ -
-    """
     s = norm_text(value)
     if not s:
         return ""
@@ -36,17 +29,10 @@ def clean_sku(value: str) -> str:
 
 
 def clean_folder_name(value: str) -> str:
-    """
-    Mappanévhez (CSOPORT1):
-    - ékezetek eltávolítása
-    - szóköz -> -
-    - tiltott karakterek törlése
-    """
     s = norm_text(value)
     if not s:
         return ""
 
-    # ékezetek le
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
 
@@ -56,10 +42,10 @@ def clean_folder_name(value: str) -> str:
 
 
 def build_shop_image_path(csoport1: str, model: str, slot: int = 1, ext: str = ".jpg") -> str:
-    folder = clean_folder_name(csoport1).lower()
+    folder = clean_folder_name(csoport1).lower() or "egyeb"
     base = clean_sku(model)
 
-    if not base or not folder:
+    if not base:
         return ""
 
     if slot == 1:
@@ -70,13 +56,38 @@ def build_shop_image_path(csoport1: str, model: str, slot: int = 1, ext: str = "
     return f"product/{folder}/{fname}"
 
 
+def pick_csoport1_name(product: Mapping[str, Any]) -> str:
+    for k in ("CSOPORT1", "category", "category_name", "group1"):
+        v = str(product.get(k) or "").strip()
+        if v:
+            return v
+
+    raw = product.get("raw")
+    if isinstance(raw, dict):
+        for k in ("CSOPORT1", "category", "category_name", "group1"):
+            v = str(raw.get(k) or "").strip()
+            if v:
+                return v
+
+    return ""
+
+
+def build_main_picture_path_for_product(
+    product: Mapping[str, Any],
+    *,
+    model: str,
+    slot: int = 1,
+    ext: str = ".jpg",
+) -> str:
+    return build_shop_image_path(
+        pick_csoport1_name(product),
+        model,
+        slot=slot,
+        ext=ext,
+    )
+
+
 def image_alt_from_model(name: str, model: str, *, keyword: str = "horgász termék") -> str:
-    """
-    SEO-barát ALT:
-    - tartalmazza a terméknevet (ha van)
-    - tartalmazza a modellt/cikkszámot (ha van)
-    - opcionális kulcsszó
-    """
     name = norm_text(name)
     model = norm_text(model)
 
@@ -94,9 +105,7 @@ def image_alt_from_model(name: str, model: str, *, keyword: str = "horgász term
         return base
     return "Termékkép"
 
-# ------------------------------------------------------------------
-# ÚJ: Shoprenter file upload helper-ek
-# ------------------------------------------------------------------
+
 _ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 _DEFAULT_EXT = ".jpg"
 
@@ -150,14 +159,6 @@ def build_supplier_image_filepath(
     sku: Optional[str] = None,
     model: Optional[str] = None,
 ) -> str:
-    """
-    Stabil Shoprenter filePath:
-      product/HALDEPO/149088-001.jpg
-      product/CARPZOOM/CZ7809.jpg
-
-    Ha az URL-ből nem kapunk normális nevet, fallback:
-      sku / model / hash
-    """
     folder = supplier_folder_name(supplier_name)
     ext = _guess_ext_from_url(image_url)
 
@@ -197,25 +198,24 @@ def bytes_to_base64(data: bytes) -> str:
 
 def prepare_shoprenter_image_upload(
     *,
-    supplier_name: str,
     image_url: str,
+    supplier_name: Optional[str] = None,
     sku: Optional[str] = None,
     model: Optional[str] = None,
+    file_path: Optional[str] = None,
 ) -> dict:
     """
-    Visszaad:
-    {
-        "image_url": ...,
-        "file_path": "product/HALDEPO/149088-001.jpg",
-        "base64_data": "...."
-    }
+    Ha file_path meg van adva, azt használjuk.
+    Ha nincs, marad a régi supplier-alapú fallback.
     """
-    file_path = build_supplier_image_filepath(
-        supplier_name=supplier_name,
-        image_url=image_url,
-        sku=sku,
-        model=model,
-    )
+    if not file_path:
+        file_path = build_supplier_image_filepath(
+            supplier_name=(supplier_name or "supplier"),
+            image_url=image_url,
+            sku=sku,
+            model=model,
+        )
+
     raw = download_image_bytes(image_url)
     base64_data = bytes_to_base64(raw)
 

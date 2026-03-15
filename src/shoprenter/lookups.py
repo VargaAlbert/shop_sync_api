@@ -31,7 +31,10 @@ Ez a függvény lapozva beolvassa az összes productExtend elemet,
 
 from typing import Dict
 import time
+import unicodedata
+from typing import Dict, Any
 
+from src.shoprenter.client import ShoprenterClient
 
 def build_product_sku_map(
     client,
@@ -145,6 +148,118 @@ def build_product_sku_map(
             )
 
         # Rate limit védelem
+        time.sleep(sleep_s)
+
+    return out
+
+def _norm_lookup_name(value: str) -> str:
+    s = str(value or "").strip().lower()
+    if not s:
+        return ""
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return " ".join(s.split())
+
+
+def _extract_manufacturer_name(item: Dict[str, Any]) -> str:
+    for k in ("name", "manufacturer_name", "title"):
+        v = str(item.get(k) or "").strip()
+        if v:
+            return v
+
+    desc = item.get("manufacturerDescription")
+    if isinstance(desc, dict):
+        for k in ("name", "title"):
+            v = str(desc.get(k) or "").strip()
+            if v:
+                return v
+
+    return ""
+
+
+def _extract_id(ref: Any) -> str:
+    if isinstance(ref, dict):
+        rid = str(ref.get("id") or "").strip()
+        if rid:
+            return rid
+
+        href = str(ref.get("href") or "").strip()
+        if href:
+            return href.rsplit("/", 1)[-1].strip()
+
+    if isinstance(ref, str):
+        s = ref.strip()
+        if not s:
+            return ""
+        if "/" in s:
+            return s.rsplit("/", 1)[-1].strip()
+        return s
+
+    return ""
+
+def _extract_manufacturer_name_from_product_extend(item: Dict[str, Any]) -> str:
+    m = item.get("manufacturer")
+
+    if isinstance(m, dict):
+        for k in ("name", "title"):
+            v = str(m.get(k) or "").strip()
+            if v:
+                return v
+
+        md = m.get("manufacturerDescription")
+        if isinstance(md, dict):
+            for k in ("name", "title"):
+                v = str(md.get(k) or "").strip()
+                if v:
+                    return v
+
+    return ""
+
+
+def build_manufacturer_name_map(
+    client,
+    *,
+    limit: int = 200,
+    sleep_s: float = 0.2,
+    max_pages: int = 2000,
+) -> Dict[str, str]:
+    """
+    A teljes manufacturer listából épít name -> id mapet.
+    Ez megbízhatóbb, mint a productExtend alapú megoldás.
+    """
+    out: Dict[str, str] = {}
+    started = time.time()
+
+    for page in range(0, max_pages):
+        data = client.get_page("/manufacturers", page=page, limit=limit, full=True)
+        items = data.get("items") or []
+        if not isinstance(items, list):
+            break
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            mid = _extract_id(item)
+            name = _extract_manufacturer_name(item)
+
+            key = _norm_lookup_name(name)
+            if key and mid and key not in out:
+                out[key] = mid
+
+        page_count = int(data.get("pageCount") or 0)
+
+        print(
+            f"[MANUFACTURER_MAP] page={page}/{page_count or '?'} "
+            f"items={len(items)} map_size={len(out)} dt={time.time()-started:.2f}s"
+        )
+
+        if page_count and page >= page_count - 1:
+            break
+        if not page_count and len(items) < limit:
+            break
+
         time.sleep(sleep_s)
 
     return out

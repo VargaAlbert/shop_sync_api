@@ -3,7 +3,7 @@ from __future__ import annotations
 import requests
 from requests.auth import HTTPBasicAuth
 from typing import Dict, Any, Optional
-
+import os
 
 class ShoprenterClient:
     def __init__(self, base_url: str, user: str, password: str):
@@ -62,17 +62,21 @@ class ShoprenterClient:
     def get_product_extend_page(
         self,
         *,
-        page: int = 1,
+        page: int = 0,
         limit: int = 200,
         full: bool = False,
     ) -> Dict[str, Any]:
+        params = {
+            "page": page,
+            "limit": limit,
+        }
+
+        if full:
+            params["full"] = 1
+
         resp = self.session.get(
             self._url("/productExtend"),
-            params={
-                "page": page,
-                "limit": limit,
-                "full": str(full).lower(),
-            },
+            params=params,
             timeout=self.timeout,
         )
         resp.raise_for_status()
@@ -91,7 +95,8 @@ class ShoprenterClient:
                 params={
                     "sku": sku,
                     "limit": 1,
-                    "full": "true",
+                    "page": 0,
+                    "full": 1,
                 },
                 timeout=self.timeout,
             )
@@ -134,4 +139,32 @@ class ShoprenterClient:
         if not resp.text.strip():
             return {}
 
+        return resp.json()
+
+    def get_page(
+        self,
+        path: str,
+        *,
+        page: int = 1,
+        limit: int = 200,
+        full: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "page": page,
+            "limit": limit,
+        }
+        if full:
+            params["full"] = 1
+        if extra_params:
+            params.update(extra_params)
+
+        resp = self.session.get(
+            self._url(path),
+            params=params,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        if not resp.text.strip():
+            return {}
         return resp.json()
