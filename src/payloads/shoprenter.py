@@ -418,7 +418,8 @@ def build_enrich_update_payload(
     name_hu = _pick_name_hu(p)
     model = str(p.get("model") or "").strip() or sku
 
-    main_img = _default_main_picture_from_product(p, model=model)
+    # csak a ténylegesen előkészített / feltöltött képet használjuk
+    main_img = _pick_prepared_shoprenter_main_image(p)
 
     image_alt = _default_image_alt_from_product(
         p,
@@ -437,10 +438,12 @@ def build_enrich_update_payload(
 
     payload: Dict[str, Any] = {
         "sku": sku,
-        "mainPicture": main_img,
         "imageAlt": image_alt,
         "customerGroupProductPrices": customer_group_prices,
     }
+
+    if has_image_part:
+        payload["mainPicture"] = main_img
 
     if has_description_part:
         if not product_id:

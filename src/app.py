@@ -166,23 +166,22 @@ AJÁNLOTT NAPI ÜTEMEZÉS
 1. PREFETCH_ALL
    Nem kötelező minden futás előtt, de hasznos lehet:
 
-    02:00
+    01:00
 
 2. MASTER_ALL
    A legtöbb napi szinkronhoz ez a legpraktikusabb:
 
-    10:00
-    14:00
-    18:00
-    00:00
+
+    17:00
+    23:00
 
 3. ENRICH_UPDATE_ALL
 
-    03:00
+    02:00
 
 4. DELETE_ALL
 
-    06:00
+    07:00
 
 Megjegyzés:
 Ha nem a kombinált futást használod, akkor a MASTER_CREATE_ALL és

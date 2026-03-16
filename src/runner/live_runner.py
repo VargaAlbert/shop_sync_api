@@ -226,6 +226,13 @@ def _resolve_enrich_main_picture(
     sku = str(p.get("sku") or "").strip() or None
     model = str(p.get("model") or "").strip() or sku
 
+    parsed = urlparse(image_url)
+    filename = os.path.basename(parsed.path)
+
+    if not filename or "." not in filename:
+        log.warning("ENRICH invalid image url sku=%s url=%s", sku, image_url)
+        return p
+
     target_file_path = build_main_picture_path_for_product(
         p,
         model=model,
@@ -264,6 +271,17 @@ def _resolve_enrich_main_picture(
             sku,
             target_file_path,
         )
+
+    except Exception as e:
+        log.warning(
+            "ENRICH image skipped sku=%s url=%s target=%s error=%s",
+            sku,
+            image_url,
+            target_file_path,
+            e,
+        )
+
+    return p
 
     except Exception as e:
         log.warning(
