@@ -234,8 +234,6 @@ def main() -> None:
                     "MASTER_CREATE",
                     p_merged,
                     language_id=DEFAULT_LANGUAGE_ID,
-                    status_value=0,
-                    stock1=0,
                 ),
             }
             ok_create += 1

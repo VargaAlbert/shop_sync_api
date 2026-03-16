@@ -304,6 +304,15 @@ def _build_product_descriptions_for_enrich(
 def _default_image_alt_from_product(p: Dict[str, Any], *, name_hu: str, model: str) -> str:
     return image_alt_from_model(name_hu, model)
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+DEFAULT_CREATE_STOCK1 = _env_int("SHOPRENTER_CREATE_STOCK1", 99999)
+
 # ---------------------------------------------------------------------
 # Mode-specifikus builder-ek
 # ---------------------------------------------------------------------
@@ -312,7 +321,7 @@ def build_master_create_payload(
     *,
     language_id: str,
     status_value: int = 0,
-    stock1: int = 0,
+    stock1: int = DEFAULT_CREATE_STOCK1,
     category_id: Optional[str] = None,
     category_map: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
@@ -501,7 +510,7 @@ def build_product_extend_from_product(
     *,
     language_id: str = DEFAULT_LANGUAGE_ID,
     status_value: int = 0,
-    stock1: int = 0,
+    stock1: int = DEFAULT_CREATE_STOCK1,
     category_id: Optional[str] = None,
     category_map: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
