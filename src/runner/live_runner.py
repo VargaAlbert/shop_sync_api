@@ -283,17 +283,6 @@ def _resolve_enrich_main_picture(
 
     return p
 
-    except Exception as e:
-        log.warning(
-            "ENRICH image skipped sku=%s url=%s target=%s error=%s",
-            sku,
-            image_url,
-            target_file_path,
-            e,
-        )
-
-    return p
-
 def _norm_manufacturer_name(value: str) -> str:
     import unicodedata
 
