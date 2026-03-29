@@ -114,13 +114,66 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
 # ---------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+def _pick_existing_short_desc_hu(p: Dict[str, Any]) -> str:
+    for k in (
+        "current_short_description_hu",
+        "existing_short_description_hu",
+        "shoprenter_short_description_hu",
+    ):
+        v = str(p.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _pick_existing_long_desc_hu(p: Dict[str, Any]) -> str:
+    for k in (
+        "current_description_hu",
+        "existing_description_hu",
+        "shoprenter_description_hu",
+    ):
+        v = str(p.get(k) or "").strip()
+        if v:
+            return v
+    return ""
+
+def _resolve_description_pair_for_upload(
+    p: Dict[str, Any],
+    *,
+    new_long_desc_hu: str,
+) -> tuple[str, str]:
+    current_short = _pick_existing_short_desc_hu(p)
+    current_long = _pick_existing_long_desc_hu(p)
+
+    swap_enabled = _env_bool("SHOPRENTER_DESCRIPTION_SWAP_ENABLED", default=True)
+
+    # csak akkor cserélünk, ha:
+    # - a swap engedélyezve van
+    # - a jelenlegi hosszú leírás üres
+    # - van jelenlegi rövid leírás
+    do_swap = swap_enabled and not current_long and bool(current_short)
+
+    if do_swap:
+        final_short = ""
+        final_long_base = current_short
+    else:
+        final_short = current_short
+        final_long_base = current_long
+
+    final_long = str(new_long_desc_hu or "").strip() or final_long_base
+
+    return final_short, final_long
+
 def filter_payload(data: Dict[str, Any], fields: Set[str]) -> Dict[str, Any]:
     return {k: v for k, v in data.items() if k in fields and v is not None}
 
 
 def _fmt_price(x: float) -> str:
     return f"{float(x):.4f}"
-
 
 def _require_str(p: Dict[str, Any], key: str, *, ctx: str) -> str:
     v = str(p.get(key, "")).strip()
@@ -275,6 +328,7 @@ def _build_product_descriptions_for_create_or_update(
     language_id: str,
     name_hu: str,
     desc_hu: str,
+    short_desc_hu: str = "",
 ) -> list[Dict[str, Any]]:
     item: Dict[str, Any] = {
         "name": name_hu,
@@ -282,8 +336,13 @@ def _build_product_descriptions_for_create_or_update(
             "id": language_id,
         },
     }
+
+    if short_desc_hu:
+        item["shortDescription"] = short_desc_hu
+
     if desc_hu:
         item["description"] = desc_hu
+
     return [item]
 
 
@@ -293,13 +352,20 @@ def _build_product_descriptions_for_enrich(
     language_id: str,
     name_hu: str,
     desc_hu: str,
+    short_desc_hu: str = "",
 ) -> list[Dict[str, Any]]:
     item: Dict[str, Any] = {
         "product": {"id": product_id},
         "language": {"id": language_id},
         "name": name_hu,
-        "description": desc_hu,
     }
+
+    if short_desc_hu:
+        item["shortDescription"] = short_desc_hu
+
+    if desc_hu:
+        item["description"] = desc_hu
+
     return [item]
 
 def _default_image_alt_from_product(p: Dict[str, Any], *, name_hu: str, model: str) -> str:
@@ -401,6 +467,11 @@ def build_master_update_payload(
         model=model,
     )
 
+    preserved_short_desc_hu, final_long_desc_hu = _resolve_description_pair_for_upload(
+        p,
+        new_long_desc_hu="",   # MASTER_UPDATE csak nevet frissít, új leírást nem ad
+    )
+
     payload: Dict[str, Any] = {
         "sku": sku,
         "modelNumber": model,
@@ -411,12 +482,15 @@ def build_master_update_payload(
         "imageAlt": image_alt,
         "customerGroupProductPrices": _customer_group_product_prices(p),
         "manufacturer": _manufacturer_ref(p, allow_name_fallback=False),
-        "productDescriptions": _build_product_descriptions_for_create_or_update(
+    }
+
+    if preserved_short_desc_hu or final_long_desc_hu:
+        payload["productDescriptions"] = _build_product_descriptions_for_create_or_update(
             language_id=language_id,
             name_hu=name_hu,
-            desc_hu="",   # csak név frissítés
-        ),
-    }
+            desc_hu=final_long_desc_hu,
+            short_desc_hu=preserved_short_desc_hu,
+        )
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
 
@@ -429,11 +503,10 @@ def build_enrich_update_payload(
 ) -> Dict[str, Any]:
     sku = _require_str(p, "sku", ctx="enrich_update")
 
-    desc_hu = _pick_desc_hu(p)
+    new_desc_hu = _pick_desc_hu(p)
     name_hu = _pick_name_hu(p)
     model = str(p.get("model") or "").strip() or sku
 
-    # csak a ténylegesen előkészített / feltöltött képet használjuk
     main_img = _pick_prepared_shoprenter_main_image(p)
 
     image_alt = _default_image_alt_from_product(
@@ -444,7 +517,12 @@ def build_enrich_update_payload(
 
     customer_group_prices = _customer_group_product_prices(p)
 
-    has_description_part = bool(desc_hu)
+    preserved_short_desc_hu, final_long_desc_hu = _resolve_description_pair_for_upload(
+        p,
+        new_long_desc_hu=new_desc_hu,
+    )
+
+    has_description_part = bool(preserved_short_desc_hu or final_long_desc_hu)
     has_image_part = bool(main_img)
     has_wholesale_part = bool(customer_group_prices)
 
@@ -468,7 +546,8 @@ def build_enrich_update_payload(
             product_id=product_id,
             language_id=language_id,
             name_hu=name_hu,
-            desc_hu=desc_hu,
+            desc_hu=final_long_desc_hu,
+            short_desc_hu=preserved_short_desc_hu,
         )
 
     return filter_payload(payload, PAYLOAD_FIELDS["ENRICH_UPDATE"])

@@ -263,3 +263,90 @@ def build_manufacturer_name_map(
         time.sleep(sleep_s)
 
     return out
+
+def _extract_product_descriptions_for_language(
+    item: Dict[str, Any],
+    *,
+    language_id: str,
+) -> Dict[str, str]:
+    out = {
+        "name": "",
+        "short_description": "",
+        "description": "",
+        "product_description_id": "",
+        "language_id": "",
+    }
+
+    rows = item.get("productDescriptions") or []
+    if not isinstance(rows, list):
+        return out
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        row_language_id = _extract_id(row.get("language"))
+        if row_language_id and row_language_id != language_id:
+            continue
+
+        out["name"] = str(row.get("name") or "").strip()
+        out["short_description"] = str(row.get("shortDescription") or "").strip()
+        out["description"] = str(row.get("description") or "").strip()
+        out["product_description_id"] = _extract_id(row)
+        out["language_id"] = row_language_id
+        return out
+
+    return out
+
+
+def build_product_description_map(
+    client,
+    *,
+    language_id: str,
+    limit: int = 200,
+    sleep_s: float = 0.2,
+    max_pages: int = 2000,
+) -> Dict[str, Dict[str, str]]:
+    page = 0
+    out: Dict[str, Dict[str, str]] = {}
+
+    while True:
+        data = client.get_product_extend_page(
+            page=page,
+            limit=limit,
+            full=True,
+        )
+
+        page_count = int(data.get("pageCount") or 0)
+        items = data.get("items", []) or []
+
+        for item in items:
+            sku = str(item.get("sku") or "").strip()
+            if not sku:
+                continue
+
+            out[sku] = _extract_product_descriptions_for_language(
+                item,
+                language_id=language_id,
+            )
+
+        print(
+            f"[DESCRIPTION_MAP] "
+            f"page={page+1}/{page_count} "
+            f"items={len(items)} "
+            f"map_size={len(out)}"
+        )
+
+        page += 1
+
+        if page_count and page >= page_count:
+            break
+
+        if page >= max_pages:
+            raise RuntimeError(
+                f"Vészfék: max_pages elérve ({max_pages}) a build_product_description_map közben."
+            )
+
+        time.sleep(sleep_s)
+
+    return out

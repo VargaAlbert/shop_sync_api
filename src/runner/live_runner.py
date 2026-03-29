@@ -11,7 +11,12 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 
-from src.shoprenter.lookups import build_product_sku_map, build_manufacturer_name_map
+from src.shoprenter.lookups import (
+    build_product_sku_map,
+    build_manufacturer_name_map,
+    build_product_description_map,
+)
+
 from src.core.pipeline import run_pipeline
 from src.payloads.shoprenter import build_payload, DEFAULT_LANGUAGE_ID
 from src.shoprenter.client import ShoprenterClient
@@ -333,6 +338,24 @@ def _extract_created_manufacturer_id_and_name(resp: dict) -> tuple[str, str]:
 
     return mid, name
 
+def _attach_existing_descriptions_for_payload(
+    product: dict,
+    description_map: dict[str, dict[str, str]],
+) -> dict:
+    p = dict(product)
+
+    sku = str(p.get("sku") or "").strip()
+    if not sku:
+        return p
+
+    info = description_map.get(sku) or {}
+
+    p["current_short_description_hu"] = str(info.get("short_description") or "").strip()
+    p["current_description_hu"] = str(info.get("description") or "").strip()
+    p["_current_product_description_id"] = str(info.get("product_description_id") or "").strip()
+
+    return p
+
 def run_master_create_all(*, master_supplier: str) -> RunStats:
     log = setup_logging()
     client = _create_client()
@@ -445,6 +468,14 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
     )
     log.info("Manufacturer map loaded: %s", len(manufacturer_map))
 
+    log.info("Description map building...")
+    description_map = build_product_description_map(
+        client,
+        language_id=DEFAULT_LANGUAGE_ID,
+        limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
+    )
+    log.info("Description map loaded: %s", len(description_map))
+
     log.info("Pipeline running (master=%s)...", master_supplier)
     res = run_pipeline(
         master_supplier=master_supplier,
@@ -470,12 +501,17 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
             skipped += 1
             continue
 
-        prepared_product = _resolve_manufacturer_for_payload(
-            dict(p),
-            manufacturer_map,
-        )
-
         try:
+            prepared_product = _resolve_manufacturer_for_payload(
+                dict(p),
+                manufacturer_map,
+            )
+
+            prepared_product = _attach_existing_descriptions_for_payload(
+                prepared_product,
+                description_map,
+            )
+
             payload = build_payload(
                 "MASTER_UPDATE",
                 prepared_product,
@@ -540,6 +576,14 @@ def run_enrich_update_all(*, master_supplier: str) -> RunStats:
         limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
     )
 
+    log.info("Description map building...")
+    description_map = build_product_description_map(
+        client,
+        language_id=DEFAULT_LANGUAGE_ID,
+        limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
+    )
+    log.info("Description map loaded: %s", len(description_map))
+
     log.info("Pipeline running (master=%s)...", master_supplier)
     res = run_pipeline(
         master_supplier=master_supplier,
@@ -574,6 +618,11 @@ def run_enrich_update_all(*, master_supplier: str) -> RunStats:
                 client,
                 dict(p),
                 log=log,
+            )
+
+            prepared_product = _attach_existing_descriptions_for_payload(
+                prepared_product,
+                description_map,
             )
 
             payload = build_payload(
@@ -707,6 +756,14 @@ def run_master_all(*, master_supplier: str) -> RunStats:
     )
     log.info("Manufacturer map loaded: %s", len(manufacturer_map))
 
+    log.info("Description map building...")
+    description_map = build_product_description_map(
+        client,
+        language_id=DEFAULT_LANGUAGE_ID,
+        limit=int(os.getenv("SKU_MAP_LIMIT", "200")),
+    )
+    log.info("Description map loaded: %s", len(description_map))
+
     log.info("Pipeline running (master=%s)...", master_supplier)
     res = run_pipeline(
         master_supplier=master_supplier,
@@ -729,12 +786,17 @@ def run_master_all(*, master_supplier: str) -> RunStats:
 
         pid = sku_map.get(sku)
 
-        prepared_product = _resolve_manufacturer_for_payload(
-            dict(p),
-            manufacturer_map,
-        )
-
         try:
+            prepared_product = _resolve_manufacturer_for_payload(
+                dict(p),
+                manufacturer_map,
+            )
+
+            prepared_product = _attach_existing_descriptions_for_payload(
+                prepared_product,
+                description_map,
+            )
+
             if not pid:
                 payload = build_payload(
                     "MASTER_CREATE",
