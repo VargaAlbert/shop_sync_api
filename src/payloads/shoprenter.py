@@ -10,7 +10,7 @@ Publikus API:
 
 Fő elvek:
 - MASTER_CREATE: teljes create payload
-- MASTER_UPDATE: csak alap mezők, productDescriptions NINCS
+- MASTER_UPDATE: alap mezők + opcionálisan productDescriptions a név frissítéséhez
 - ENRICH_UPDATE: leírás / kép / nagyker ár frissítés
 - A Shoprenter a price mezőt nettóként kezeli
 - A vevőcsoport árakhoz a helyes inline mező:
@@ -94,6 +94,7 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "imageAlt",
         "customerGroupProductPrices",
         "manufacturer",
+        "productDescriptions",
     },
     "ENRICH_UPDATE": {
         "sku",
@@ -410,6 +411,11 @@ def build_master_update_payload(
         "imageAlt": image_alt,
         "customerGroupProductPrices": _customer_group_product_prices(p),
         "manufacturer": _manufacturer_ref(p, allow_name_fallback=False),
+        "productDescriptions": _build_product_descriptions_for_create_or_update(
+            language_id=language_id,
+            name_hu=name_hu,
+            desc_hu="",   # csak név frissítés
+        ),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])
