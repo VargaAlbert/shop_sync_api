@@ -10,7 +10,7 @@ Publikus API:
 
 Fő elvek:
 - MASTER_CREATE: teljes create payload
-- MASTER_UPDATE: csak alap mezők, productDescriptions NINCS
+- MASTER_UPDATE: alap mezők + opcionálisan productDescriptions a név frissítéséhez
 - ENRICH_UPDATE: leírás / kép / nagyker ár frissítés
 - A Shoprenter a price mezőt nettóként kezeli
 - A vevőcsoport árakhoz a helyes inline mező:
@@ -94,6 +94,7 @@ PAYLOAD_FIELDS: PayloadFieldSets = {
         "imageAlt",
         "customerGroupProductPrices",
         "manufacturer",
+        "productDescriptions",
     },
     "ENRICH_UPDATE": {
         "sku",
@@ -297,8 +298,9 @@ def _build_product_descriptions_for_enrich(
         "product": {"id": product_id},
         "language": {"id": language_id},
         "name": name_hu,
-        "description": desc_hu,
     }
+    if desc_hu:
+        item["description"] = desc_hu
     return [item]
 
 def _default_image_alt_from_product(p: Dict[str, Any], *, name_hu: str, model: str) -> str:
@@ -380,6 +382,7 @@ def build_master_update_payload(
     p: Dict[str, Any],
     *,
     language_id: str,
+    product_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     sku = _require_str(p, "sku", ctx="master_update")
 
@@ -387,9 +390,11 @@ def build_master_update_payload(
     if gross is None:
         raise ValueError(f"Missing gross_price (master_update sku={sku})")
 
+    if not product_id:
+        raise ValueError(f"Missing product_id (master_update sku={sku})")
+
     model = str(p.get("model") or "").strip() or sku
     gtin = str(p.get("gtin") or p.get("ean") or "").strip() or None
-
     name_hu = _pick_name_hu(p)
 
     main_img = _default_main_picture_from_product(p, model=model)
@@ -410,6 +415,12 @@ def build_master_update_payload(
         "imageAlt": image_alt,
         "customerGroupProductPrices": _customer_group_product_prices(p),
         "manufacturer": _manufacturer_ref(p, allow_name_fallback=False),
+        "productDescriptions": _build_product_descriptions_for_enrich(
+            product_id=product_id,
+            language_id=language_id,
+            name_hu=name_hu,
+            desc_hu="",
+        ),
     }
 
     return filter_payload(payload, PAYLOAD_FIELDS["MASTER_UPDATE"])

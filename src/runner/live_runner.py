@@ -480,6 +480,7 @@ def run_master_update_all(*, master_supplier: str) -> RunStats:
                 "MASTER_UPDATE",
                 prepared_product,
                 language_id=DEFAULT_LANGUAGE_ID,
+                product_id=pid,
             )
 
             if not payload:
@@ -737,9 +738,10 @@ def run_master_all(*, master_supplier: str) -> RunStats:
         try:
             if not pid:
                 payload = build_payload(
-                    "MASTER_CREATE",
+                    "MASTER_UPDATE",
                     prepared_product,
                     language_id=DEFAULT_LANGUAGE_ID,
+                    product_id=pid,
                 )
 
                 if not payload:
